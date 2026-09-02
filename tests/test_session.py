@@ -1,3 +1,5 @@
+import pytest
+
 from haro_server.session import Session
 
 
@@ -71,17 +73,32 @@ async def test_handle_audio_frame_feeds_stt():
 
 
 async def test_end_of_speech_sends_emotion_then_audio_then_response_end():
+    # Record every send onto ONE shared, ordered list so the test can
+    # actually tell if audio was sent before the emotion message (two
+    # separate lists, one per channel, cannot prove cross-channel order).
+    events: list[tuple[str, object]] = []
+
+    async def send_text(text: str) -> None:
+        events.append(("text", text))
+
+    async def send_binary(data: bytes) -> None:
+        events.append(("binary", data))
+
+    stt = FakeStt(transcript="ciao come stai")
     # Emotion prefix split across two LLM chunks, on purpose.
-    session, stt, llm, tts, sent_text, sent_binary = _make_session(
-        llm_chunks=["[emo", "tion:happy] Ciao! ", "Come posso aiutarti?"]
-    )
+    llm = FakeLlm(chunks=["[emo", "tion:happy] Ciao! ", "Come posso aiutarti?"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary)
 
     await session.handle_end_of_speech()
 
     assert llm.received_transcript == "ciao come stai"
-    assert sent_text[0] == '{"type": "emotion", "value": "happy"}'
-    assert sent_text[-1] == '{"type": "response_end"}'
-    assert sent_binary == [b"audio:Ciao! ", b"audio:Come posso aiutarti?"]
+    assert events == [
+        ("text", '{"type": "emotion", "value": "happy"}'),
+        ("binary", b"audio:Ciao! "),
+        ("binary", b"audio:Come posso aiutarti?"),
+        ("text", '{"type": "response_end"}'),
+    ]
     assert tts.received_text == ["Ciao! ", "Come posso aiutarti?"]
 
 
@@ -108,3 +125,86 @@ async def test_end_of_speech_falls_back_to_neutral_for_long_reply_without_tag():
 
     assert sent_text[0] == '{"type": "emotion", "value": "neutral"}'
     assert "".join(tts.received_text) == long_reply
+
+
+class _TrackingStream:
+    """Wraps a plain async generator, counting explicit aclose() calls
+    separately from natural exhaustion (which also runs a generator's
+    `finally` block) -- used to prove the Session promptly closes the
+    LLM's stream on both success and abort, instead of relying on GC.
+    """
+
+    def __init__(self, chunks: list[str]) -> None:
+        self._gen = self._make(chunks)
+        self.aclose_calls = 0
+
+    async def _make(self, chunks: list[str]):
+        for chunk in chunks:
+            yield chunk
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self._gen.__anext__()
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        await self._gen.aclose()
+
+
+class TrackingLlm:
+    def __init__(self, chunks: list[str]) -> None:
+        self._chunks = chunks
+        self.stream: _TrackingStream | None = None
+
+    def stream_reply(self, transcript: str):
+        self.stream = _TrackingStream(self._chunks)
+        return self.stream
+
+
+async def test_end_of_speech_closes_llm_stream_after_normal_completion():
+    sent_text: list[str] = []
+    sent_binary: list[bytes] = []
+
+    async def send_text(text: str) -> None:
+        sent_text.append(text)
+
+    async def send_binary(data: bytes) -> None:
+        sent_binary.append(data)
+
+    stt = FakeStt(transcript="ciao come stai")
+    llm = TrackingLlm(chunks=["[emotion:happy] Ciao!"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary)
+
+    await session.handle_end_of_speech()
+
+    # The fix must not break the successful path: it completes normally,
+    # response_end is still sent, and the LLM stream is closed exactly once.
+    assert sent_text[-1] == '{"type": "response_end"}'
+    assert llm.stream is not None
+    assert llm.stream.aclose_calls == 1
+
+
+async def test_end_of_speech_closes_llm_stream_when_turn_is_aborted():
+    calls = {"n": 0}
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("client disconnected")
+
+    stt = FakeStt(transcript="ciao come stai")
+    llm = TrackingLlm(chunks=["[emotion:happy] Ciao! ", "Come posso aiutarti?"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary)
+
+    with pytest.raises(RuntimeError):
+        await session.handle_end_of_speech()
+
+    assert llm.stream is not None
+    assert llm.stream.aclose_calls == 1

@@ -52,14 +52,24 @@ class Session:
 
     async def handle_end_of_speech(self) -> None:
         transcript = self._stt.finalize()
-        logger.info("transcript: %s", transcript)
+        logger.debug("transcript: %s", transcript)
 
         raw_reply = self._llm.stream_reply(transcript)
         emotion, text_stream = await _split_emotion_prefix(raw_reply)
         await self._send_text(protocol.encode_emotion(emotion))
 
-        async for chunk in self._tts.synthesize(text_stream):
-            await self._send_binary(chunk)
+        try:
+            async for chunk in self._tts.synthesize(text_stream):
+                await self._send_binary(chunk)
+        finally:
+            # text_stream (the _prepend wrapper) only delegates to raw_reply
+            # via `async for`, which does NOT cascade .aclose() to it -- so
+            # both must be closed explicitly, or an aborted turn (e.g. the
+            # robot disconnects mid-reply) leaves the LLM's generator/
+            # connection suspended until garbage collection eventually gets
+            # to it, instead of closing promptly.
+            await text_stream.aclose()
+            await raw_reply.aclose()
 
         await self._send_text(protocol.encode_response_end())
 
