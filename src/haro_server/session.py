@@ -54,6 +54,15 @@ class Session:
         transcript = await self._stt.finalize()
         logger.debug("transcript: %s", transcript)
 
+        if not transcript.strip():
+            # Silence, or a VAD false trigger: nothing was said, so there is
+            # nothing to reply to. Providers reject empty user content, so
+            # driving a full LLM/TTS turn here would just error out. End the
+            # turn cleanly instead so the robot stops waiting.
+            logger.info("empty transcript, skipping LLM/TTS turn")
+            await self._send_text(protocol.encode_response_end())
+            return
+
         raw_reply = self._llm.stream_reply(transcript)
         emotion, text_stream = await _split_emotion_prefix(raw_reply)
         await self._send_text(protocol.encode_emotion(emotion))

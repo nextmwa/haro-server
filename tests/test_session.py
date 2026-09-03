@@ -19,8 +19,10 @@ class FakeLlm:
     def __init__(self, chunks: list[str]) -> None:
         self._chunks = chunks
         self.received_transcript: str | None = None
+        self.stream_reply_calls = 0
 
     def stream_reply(self, transcript: str):
+        self.stream_reply_calls += 1
         self.received_transcript = transcript
         return self._chunk_generator()
 
@@ -32,8 +34,16 @@ class FakeLlm:
 class FakeTts:
     def __init__(self) -> None:
         self.received_text: list[str] = []
+        # Counted in the plain (non-generator) wrapper, so a call that is
+        # never iterated is still recorded -- an `async def ... yield` body
+        # would not run at all until the first __anext__.
+        self.synthesize_calls = 0
 
-    async def synthesize(self, text_stream):
+    def synthesize(self, text_stream):
+        self.synthesize_calls += 1
+        return self._synthesize(text_stream)
+
+    async def _synthesize(self, text_stream):
         async for text in text_stream:
             self.received_text.append(text)
             yield f"audio:{text}".encode()
@@ -125,6 +135,30 @@ async def test_end_of_speech_falls_back_to_neutral_for_long_reply_without_tag():
 
     assert sent_text[0] == '{"type": "emotion", "value": "neutral"}'
     assert "".join(tts.received_text) == long_reply
+
+
+async def test_end_of_speech_with_empty_transcript_skips_llm_and_tts():
+    events: list[tuple[str, object]] = []
+
+    async def send_text(text: str) -> None:
+        events.append(("text", text))
+
+    async def send_binary(data: bytes) -> None:
+        events.append(("binary", data))
+
+    # Whitespace-only: silence or a VAD false trigger, not speech.
+    stt = FakeStt(transcript="   \n ")
+    llm = FakeLlm(chunks=["[emotion:happy] non dovrebbe accadere"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary)
+
+    await session.handle_end_of_speech()
+
+    assert llm.stream_reply_calls == 0
+    assert tts.synthesize_calls == 0
+    assert tts.received_text == []
+    # Only response_end: no emotion message, no audio.
+    assert events == [("text", '{"type": "response_end"}')]
 
 
 class _TrackingAsyncGen:
