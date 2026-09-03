@@ -97,8 +97,12 @@ variables in the Docker deployment — never committed):
 - `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` — set whichever
   ones you have; only the one matching `DEFAULT_MODEL` needs to be present.
 - `DEFAULT_MODEL` — the LiteLLM model string to use for conversations (e.g.
-  `claude-sonnet-5`, `gpt-5.1`, `gemini-2.5-pro`). Selects both the model
-  and, implicitly via LiteLLM's routing, which API key is used.
+  `claude-sonnet-5`, `gpt-5.1`, `gemini/gemini-2.5-pro`). Selects both the
+  model and, implicitly via LiteLLM's routing, which API key is used. Note
+  the `gemini/` prefix: it is what makes LiteLLM route through the Gemini
+  API using `GEMINI_API_KEY`, whereas the bare `gemini-2.5-pro` routes to
+  Vertex AI (GCP credentials, not this key) — see `.env.example` for the
+  fuller explanation.
 - `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD` — connection to the Graphiti
   backing store (defaults match the bundled `docker-compose.yml` service).
 - `STT_DEVICE`, `TTS_DEVICE` — `cuda` or `cpu` (default `cpu`; set to `cuda`
