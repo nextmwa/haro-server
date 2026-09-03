@@ -1,3 +1,4 @@
+import asyncio
 import re
 from typing import AsyncIterator
 
@@ -58,9 +59,25 @@ class KokoroTtsEngine:
             boundary = _find_sentence_boundary(buffer)
             while boundary is not None:
                 sentence, buffer = buffer[:boundary], buffer[boundary:]
-                for _, _, audio in self._pipeline(sentence, voice=self._voice):
-                    yield _to_pcm16(_as_numpy(audio))
+                for pcm_chunk in await asyncio.to_thread(
+                    self._synthesize_sentence, sentence
+                ):
+                    yield pcm_chunk
                 boundary = _find_sentence_boundary(buffer)
         if buffer.strip():
-            for _, _, audio in self._pipeline(buffer, voice=self._voice):
-                yield _to_pcm16(_as_numpy(audio))
+            for pcm_chunk in await asyncio.to_thread(self._synthesize_sentence, buffer):
+                yield pcm_chunk
+
+    def _synthesize_sentence(self, sentence: str) -> list[bytes]:
+        # Blocking, CPU-bound model inference (2-3s per sentence on CPU per
+        # the spec). It MUST run off the event loop -- calling it inline
+        # would freeze every other connection on the server, not just this
+        # turn -- hence `asyncio.to_thread` at both call sites above. The
+        # whole sentence is synthesized into a list inside the worker
+        # thread, rather than yielding lazily, because the real KPipeline
+        # returns a synchronous generator that cannot be iterated
+        # incrementally from the event loop without blocking it again.
+        return [
+            _to_pcm16(_as_numpy(audio))
+            for _, _, audio in self._pipeline(sentence, voice=self._voice)
+        ]

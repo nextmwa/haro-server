@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 class SttEngineLike(Protocol):
     def feed(self, frame: bytes) -> None: ...
-    def finalize(self) -> str: ...
+    async def finalize(self) -> str: ...
 
 
 class LlmClientLike(Protocol):
@@ -51,7 +51,7 @@ class Session:
         self._stt.feed(frame)
 
     async def handle_end_of_speech(self) -> None:
-        transcript = self._stt.finalize()
+        transcript = await self._stt.finalize()
         logger.debug("transcript: %s", transcript)
 
         raw_reply = self._llm.stream_reply(transcript)

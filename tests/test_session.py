@@ -11,7 +11,7 @@ class FakeStt:
     def feed(self, frame: bytes) -> None:
         self.fed_frames.append(frame)
 
-    def finalize(self) -> str:
+    async def finalize(self) -> str:
         return self._transcript
 
 

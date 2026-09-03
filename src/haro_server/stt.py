@@ -1,8 +1,14 @@
+import asyncio
+
 import numpy as np
 
 
 def _bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
-    return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+    # np.frombuffer raises ValueError if the buffer length isn't a whole
+    # number of int16 samples, which a truncated/odd-sized frame from the
+    # robot can produce. Drop the dangling byte instead of failing the turn.
+    truncated = pcm_bytes[: len(pcm_bytes) & ~1]
+    return np.frombuffer(truncated, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def load_parakeet_model(device: str = "cpu"):
@@ -40,10 +46,15 @@ class ParakeetSttEngine:
     def feed(self, frame: bytes) -> None:
         self._buffer.extend(frame)
 
-    def finalize(self) -> str:
+    async def finalize(self) -> str:
         if not self._buffer:
             return ""
         audio = _bytes_to_float32(bytes(self._buffer))
-        result = self._model.transcribe([audio])
+        # Reset BEFORE transcribing: if transcribe() raises, this turn's
+        # audio must not leak into the next turn's buffer.
         self._buffer = bytearray()
+        # transcribe() is blocking, CPU-bound model inference; running it
+        # directly on the event loop would freeze every connection on the
+        # server for its whole duration.
+        result = await asyncio.to_thread(self._model.transcribe, [audio])
         return result[0].text if result else ""
