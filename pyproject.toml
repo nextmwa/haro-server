@@ -8,6 +8,13 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "websockets>=12.0",
     "litellm>=1.50.0",
+    # Pinned exactly: kokoro releases after 0.7.4 require a matching
+    # `misaki` version that PyPI has never published (misaki tops out at
+    # 0.7.4), so anything newer is currently uninstallable. 0.7.4 is the
+    # latest resolvable release and is the version this adapter was
+    # verified against (see tts.py).
+    "kokoro==0.7.4",
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]

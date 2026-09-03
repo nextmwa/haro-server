@@ -127,20 +127,16 @@ async def test_end_of_speech_falls_back_to_neutral_for_long_reply_without_tag():
     assert "".join(tts.received_text) == long_reply
 
 
-class _TrackingStream:
+class _TrackingAsyncGen:
     """Wraps a plain async generator, counting explicit aclose() calls
     separately from natural exhaustion (which also runs a generator's
-    `finally` block) -- used to prove the Session promptly closes the
-    LLM's stream on both success and abort, instead of relying on GC.
+    `finally` block) -- used to prove the Session promptly closes a
+    stream on both success and abort, instead of relying on GC.
     """
 
-    def __init__(self, chunks: list[str]) -> None:
-        self._gen = self._make(chunks)
+    def __init__(self, gen) -> None:
+        self._gen = gen
         self.aclose_calls = 0
-
-    async def _make(self, chunks: list[str]):
-        for chunk in chunks:
-            yield chunk
 
     def __aiter__(self):
         return self
@@ -153,6 +149,15 @@ class _TrackingStream:
         await self._gen.aclose()
 
 
+class _TrackingStream(_TrackingAsyncGen):
+    def __init__(self, chunks: list[str]) -> None:
+        super().__init__(self._make(chunks))
+
+    async def _make(self, chunks: list[str]):
+        for chunk in chunks:
+            yield chunk
+
+
 class TrackingLlm:
     def __init__(self, chunks: list[str]) -> None:
         self._chunks = chunks
@@ -161,6 +166,25 @@ class TrackingLlm:
     def stream_reply(self, transcript: str):
         self.stream = _TrackingStream(self._chunks)
         return self.stream
+
+
+class TrackingTts:
+    """Fake TTS engine whose synthesize() return value tracks aclose()
+    calls the same way TrackingLlm does for the LLM stream -- used to
+    prove the Session closes the TTS generator too, on both success and
+    abort, instead of only relying on GC.
+    """
+
+    def __init__(self) -> None:
+        self.stream: _TrackingAsyncGen | None = None
+
+    def synthesize(self, text_stream):
+        self.stream = _TrackingAsyncGen(self._synthesize(text_stream))
+        return self.stream
+
+    async def _synthesize(self, text_stream):
+        async for text in text_stream:
+            yield f"audio:{text}".encode()
 
 
 async def test_end_of_speech_closes_llm_stream_after_normal_completion():
@@ -208,3 +232,50 @@ async def test_end_of_speech_closes_llm_stream_when_turn_is_aborted():
 
     assert llm.stream is not None
     assert llm.stream.aclose_calls == 1
+
+
+async def test_end_of_speech_closes_tts_stream_after_normal_completion():
+    sent_text: list[str] = []
+    sent_binary: list[bytes] = []
+
+    async def send_text(text: str) -> None:
+        sent_text.append(text)
+
+    async def send_binary(data: bytes) -> None:
+        sent_binary.append(data)
+
+    stt = FakeStt(transcript="ciao come stai")
+    llm = FakeLlm(chunks=["[emotion:happy] Ciao!"])
+    tts = TrackingTts()
+    session = Session(stt, llm, tts, send_text, send_binary)
+
+    await session.handle_end_of_speech()
+
+    # The fix must not break the successful path: it completes normally,
+    # response_end is still sent, and the TTS stream is closed exactly once.
+    assert sent_text[-1] == '{"type": "response_end"}'
+    assert tts.stream is not None
+    assert tts.stream.aclose_calls == 1
+
+
+async def test_end_of_speech_closes_tts_stream_when_turn_is_aborted():
+    calls = {"n": 0}
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("client disconnected")
+
+    stt = FakeStt(transcript="ciao come stai")
+    llm = FakeLlm(chunks=["[emotion:happy] Ciao! ", "Come posso aiutarti?"])
+    tts = TrackingTts()
+    session = Session(stt, llm, tts, send_text, send_binary)
+
+    with pytest.raises(RuntimeError):
+        await session.handle_end_of_speech()
+
+    assert tts.stream is not None
+    assert tts.stream.aclose_calls == 1

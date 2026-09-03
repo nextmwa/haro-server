@@ -58,16 +58,19 @@ class Session:
         emotion, text_stream = await _split_emotion_prefix(raw_reply)
         await self._send_text(protocol.encode_emotion(emotion))
 
+        tts_stream = self._tts.synthesize(text_stream)
         try:
-            async for chunk in self._tts.synthesize(text_stream):
+            async for chunk in tts_stream:
                 await self._send_binary(chunk)
         finally:
-            # text_stream (the _prepend wrapper) only delegates to raw_reply
-            # via `async for`, which does NOT cascade .aclose() to it -- so
-            # both must be closed explicitly, or an aborted turn (e.g. the
-            # robot disconnects mid-reply) leaves the LLM's generator/
-            # connection suspended until garbage collection eventually gets
-            # to it, instead of closing promptly.
+            # tts_stream, text_stream (the _prepend wrapper), and raw_reply
+            # each only delegate to the next via `async for`, which does NOT
+            # cascade .aclose() through the chain -- so all three must be
+            # closed explicitly, or an aborted turn (e.g. the robot
+            # disconnects mid-reply) leaves generators/connections suspended
+            # until garbage collection eventually gets to them, instead of
+            # closing promptly.
+            await tts_stream.aclose()
             await text_stream.aclose()
             await raw_reply.aclose()
 
