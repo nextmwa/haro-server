@@ -16,6 +16,13 @@ dependencies = [
     # an explicit, readable resolution error instead.
     "kokoro==0.9.4",
     "numpy>=1.24.0",
+    # nemo_toolkit[asr] provides the Parakeet STT model (stt.py). Verified
+    # (see task-7-report.md) that `nemo_toolkit>=2.0.0` and its `asr` extra
+    # both really exist on PyPI (unlike Task 6's `kokoro>=1.0`, which
+    # turned out not to) and resolve cleanly on Python 3.12 -- this is a
+    # large ML toolkit (torch, lightning, huggingface_hub, lhotse,
+    # librosa, transformers, ...) so first install is slow and multi-GB.
+    "nemo_toolkit[asr]>=2.0.0",
 ]
 
 [project.optional-dependencies]
