@@ -1,0 +1,12 @@
+# Keeps the build context small: none of this is COPYed by the Dockerfile
+# (which only takes pyproject.toml and src/), and .env must never end up in
+# an image layer -- the container gets its secrets via env_file at runtime.
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+docs/
+.superpowers/
+tests/
+.env

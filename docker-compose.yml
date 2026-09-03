@@ -6,3 +6,16 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    volumes:
+      # Model weights are multi-GB and downloaded on first use, not baked
+      # into the image: Kokoro pulls hexgrad/Kokoro-82M and Parakeet pulls a
+      # ~2.3GB .nemo checkpoint, both into the HuggingFace Hub cache (Task
+      # 7's real-model run confirmed NeMo lands at
+      # ~/.cache/huggingface/hub/models--nvidia--parakeet-tdt-0.6b-v3).
+      # Without this volume every container recreate re-downloads them and
+      # pays the cold-load cost again. The Dockerfile has no USER
+      # directive, so HOME inside the container is /root.
+      - model_cache:/root/.cache/huggingface
+
+volumes:
+  model_cache:
