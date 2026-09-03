@@ -2,18 +2,19 @@
 name = "haro-server"
 version = "0.1.0"
 description = "AI backend server for the Haro personal desk robot"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "websockets>=12.0",
     "litellm>=1.50.0",
-    # Pinned exactly: kokoro releases after 0.7.4 require a matching
-    # `misaki` version that PyPI has never published (misaki tops out at
-    # 0.7.4), so anything newer is currently uninstallable. 0.7.4 is the
-    # latest resolvable release and is the version this adapter was
-    # verified against (see tts.py).
-    "kokoro==0.7.4",
+    # Pinned to 0.9.4, the version this adapter (tts.py) was verified
+    # against. Note: `kokoro` (and `misaki`, its G2P dependency) declare
+    # `requires-python < 3.13` from 0.8+ onward, so installing on Python
+    # 3.13 silently backtracks pip's resolver to the old 0.7.x line --
+    # hence the `requires-python` upper bound above, which turns that into
+    # an explicit, readable resolution error instead.
+    "kokoro==0.9.4",
     "numpy>=1.24.0",
 ]
 

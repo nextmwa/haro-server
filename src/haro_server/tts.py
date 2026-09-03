@@ -32,18 +32,23 @@ def _as_numpy(audio) -> np.ndarray:
 
 class KokoroTtsEngine:
     def __init__(self, voice: str = "if_sara", device: str = "cpu") -> None:
-        # Verified against the real, installed `kokoro==0.7.4` package (see
-        # pyproject.toml for why it's pinned to exactly that version --
-        # there is no 1.0 release; the plan's original `kokoro>=1.0` pin
-        # does not exist on PyPI, see this task's confidence note).
-        # `KPipeline.__init__(lang_code, model=True, trf=False, device=None)`
-        # accepts `device` as a keyword exactly as below. "if_sara" is a
-        # real Italian ("i") female voice for this model. Italian G2P goes
-        # through espeak-ng (`EspeakG2P`), so the `espeak-ng` system package
-        # must be installed wherever this runs (see Task 9's Dockerfile).
+        # Verified against `kokoro==0.9.4`, pinned in pyproject.toml (see
+        # its comment for why that version, not the plan's original
+        # `kokoro>=1.0` -- which does not exist on PyPI -- see this task's
+        # confidence note). `KPipeline.__init__(lang_code, repo_id=None,
+        # model=True, trf=False, en_callable=None, device=None)` still
+        # accepts `lang_code` and `device` as keywords exactly as below;
+        # 0.9.4 added the optional `repo_id` param, passed explicitly here
+        # to pin the model repo and suppress its "defaulting repo_id"
+        # warning. "if_sara" is a real Italian ("i") female voice for this
+        # model. Italian G2P goes through espeak-ng (`EspeakG2P`), so the
+        # `espeak-ng` system package must be installed wherever this runs
+        # (see Task 9's Dockerfile).
         from kokoro import KPipeline
 
-        self._pipeline = KPipeline(lang_code="i", device=device)
+        self._pipeline = KPipeline(
+            lang_code="i", repo_id="hexgrad/Kokoro-82M", device=device
+        )
         self._voice = voice
 
     async def synthesize(self, text_stream: AsyncIterator[str]) -> AsyncIterator[bytes]:
