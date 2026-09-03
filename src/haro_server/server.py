@@ -61,9 +61,16 @@ def create_app(config: Config) -> FastAPI:
                     elif isinstance(parsed, protocol.EndOfSpeechMessage):
                         try:
                             await session.handle_end_of_speech()
-                        except Exception as exc:
+                        except Exception:
+                            # Deliberately generic on the wire: str(exc) here
+                            # leaked provider tracebacks and absolute
+                            # filesystem paths to an unauthenticated client.
+                            # logger.exception already records the full
+                            # traceback server-side, where it belongs.
                             logger.exception("turn failed")
-                            await send_text(protocol.encode_error(str(exc)))
+                            await send_text(
+                                protocol.encode_error("internal error during turn")
+                            )
                 elif "bytes" in message and message["bytes"] is not None:
                     await session.handle_audio_frame(message["bytes"])
         except WebSocketDisconnect:
