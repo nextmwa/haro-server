@@ -46,6 +46,9 @@ def create_app(config: Config) -> FastAPI:
         try:
             while True:
                 message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    logger.info("session %s disconnected", session.session_id)
+                    break
                 if "text" in message and message["text"] is not None:
                     try:
                         parsed = protocol.parse_client_message(message["text"])
@@ -64,6 +67,11 @@ def create_app(config: Config) -> FastAPI:
                 elif "bytes" in message and message["bytes"] is not None:
                     await session.handle_audio_frame(message["bytes"])
         except WebSocketDisconnect:
+            # Defensive fallback in case some other code path raises this
+            # (e.g. a future refactor using receive_text()/receive_bytes()),
+            # but the explicit "websocket.disconnect" check above is what
+            # actually handles the normal disconnect case with the raw
+            # receive() loop used here.
             logger.info("session %s disconnected", session.session_id)
 
     return app
