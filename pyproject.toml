@@ -16,6 +16,13 @@ dependencies = [
     # an explicit, readable resolution error instead.
     "kokoro==0.9.4",
     "numpy>=1.24.0",
+    # Resamples Kokoro's fixed 24kHz TTS output down to the ESP32 firmware's
+    # fixed 16kHz speaker rate (tts.py's _resample_to_device_rate -- see its
+    # comment for why the mismatch exists and why it can't be fixed on the
+    # firmware side instead). Already pulled in transitively by
+    # nemo_toolkit[asr] below, but declared directly since tts.py imports it
+    # by name and that shouldn't depend on nemo's dependency tree shape.
+    "librosa>=0.10.0",
     # nemo_toolkit[asr] provides the Parakeet STT model (stt.py). Verified
     # (see task-7-report.md) that `nemo_toolkit>=2.0.0` and its `asr` extra
     # both really exist on PyPI (unlike Task 6's `kokoro>=1.0`, which

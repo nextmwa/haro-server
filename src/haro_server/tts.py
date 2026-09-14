@@ -2,9 +2,29 @@ import asyncio
 import re
 from typing import AsyncIterator
 
+import librosa
 import numpy as np
 
 _SENTENCE_END_RE = re.compile(r"[.!?]\s")
+
+# Kokoro-82M's KPipeline always synthesizes at 24kHz (its fixed native
+# output rate -- not configurable). The ESP32 firmware's speaker output is
+# fixed at 16kHz: found on real hardware that its mic (RX) and speaker (TX)
+# share one full-duplex I2S controller, and esp_codec_dev's own driver
+# refuses to open them at two different sample rates ("conflict
+# sample_rate" -- see managed_components/espressif__esp_codec_dev's
+# audio_codec_data_i2s.c in the firmware repo), so the firmware side can't
+# just match Kokoro's rate instead. Playing 24kHz audio through a
+# 16kHz-configured DAC came out slowed down and garbled -- unintelligible,
+# not just lower quality. Resample here instead.
+_KOKORO_SAMPLE_RATE = 24000
+_DEVICE_SAMPLE_RATE = 16000
+
+
+def _resample_to_device_rate(audio: np.ndarray) -> np.ndarray:
+    if _KOKORO_SAMPLE_RATE == _DEVICE_SAMPLE_RATE:
+        return audio
+    return librosa.resample(audio, orig_sr=_KOKORO_SAMPLE_RATE, target_sr=_DEVICE_SAMPLE_RATE)
 
 
 def _find_sentence_boundary(text: str) -> int | None:
@@ -78,6 +98,6 @@ class KokoroTtsEngine:
         # returns a synchronous generator that cannot be iterated
         # incrementally from the event loop without blocking it again.
         return [
-            _to_pcm16(_as_numpy(audio))
+            _to_pcm16(_resample_to_device_rate(_as_numpy(audio)))
             for _, _, audio in self._pipeline(sentence, voice=self._voice)
         ]
