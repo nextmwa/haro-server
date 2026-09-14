@@ -60,3 +60,7 @@ in isolation:
 ```
 python tools/fake_robot_client.py ws://localhost:8765/
 ```
+
+## License
+
+[MIT](LICENSE)
