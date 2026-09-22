@@ -71,6 +71,8 @@ dependencies = [
     # large ML toolkit (torch, lightning, huggingface_hub, lhotse,
     # librosa, transformers, ...) so first install is slow and multi-GB.
     "nemo_toolkit[asr]>=2.0.0",
+    # mcp_client.py's connection to GitHub's MCP server (stdio transport).
+    "mcp>=1.0.0",
 ]
 
 [project.optional-dependencies]
