@@ -69,11 +69,27 @@ class Session:
         # _play_music()/handle_interrupt().
         self._navidrome = navidrome
         self._music_task: asyncio.Task | None = None
+        # Set only while speak_announcement()'s own task is in flight --
+        # handle_interrupt() cancels this the same way it cancels
+        # _music_task, so a user turn can interrupt a proactive
+        # announcement, not just a music track.
+        self._announcement_task: asyncio.Task | None = None
         # See is_busy()/speak_announcement() below -- true only while THIS
         # object's own synchronous turn-handling is in flight; music's
         # background task (self._music_task above) is checked separately
         # since it outlives handle_end_of_speech()'s return.
         self._reply_in_progress = False
+        # Serializes handle_end_of_speech() and speak_announcement() so
+        # only one can be mid-flight at a time: both may call
+        # self._tts.synthesize() (not documented as safe for concurrent
+        # calls) and both push binary audio frames to the same WebSocket
+        # via self._send_binary -- two coroutines doing that concurrently
+        # would interleave frames on the wire. is_busy() below is a cheap
+        # pre-filter the announcer checks before ever trying to acquire
+        # this (avoids pointless lock contention from a background
+        # poller), but this lock is what actually prevents the race, not
+        # the boolean.
+        self._lock = asyncio.Lock()
         self.session_id: str | None = None
 
     async def handle_hello(self, session_id: str) -> None:
@@ -84,6 +100,14 @@ class Session:
         self._stt.feed(frame)
 
     async def handle_end_of_speech(self) -> None:
+        # Held for the full turn -- see self._lock's docstring in
+        # __init__ -- so this can never run concurrently with
+        # speak_announcement(). A real user turn simply waits for an
+        # in-flight announcement to finish rather than racing it.
+        async with self._lock:
+            await self._handle_end_of_speech_locked()
+
+    async def _handle_end_of_speech_locked(self) -> None:
         self._reply_in_progress = True
         try:
             transcript = await self._stt.finalize()
@@ -181,17 +205,21 @@ class Session:
         task.add_done_callback(_background_tasks.discard)
 
     async def handle_interrupt(self) -> None:
-        """The wake word fired while a background music task is streaming
-        (see handle_end_of_speech()'s music branch) -- cancel it. Cancelling
-        the task raises CancelledError inside whatever it's awaiting (most
-        likely navidrome.py's stream_track_as_pcm16(), mid `async for`),
-        which its own try/finally there uses to tear down the ffmpeg
-        subprocess promptly rather than leaving it running unattended.
-        A no-op if nothing is currently playing (e.g. the interrupt lost a
-        race with the track finishing naturally).
+        """The wake word fired while a background music task -- or a
+        proactive announcement (see speak_announcement()) -- is playing.
+        Cancel whichever is in flight. Cancelling a task raises
+        CancelledError inside whatever it's awaiting (most likely
+        navidrome.py's stream_track_as_pcm16(), mid `async for`, for
+        music; the TTS stream for an announcement), which the relevant
+        try/finally tears down promptly rather than leaving it running
+        unattended. A no-op if nothing is currently playing (e.g. the
+        interrupt lost a race with the track/announcement finishing
+        naturally).
         """
         if self._music_task is not None and not self._music_task.done():
             self._music_task.cancel()
+        if self._announcement_task is not None and not self._announcement_task.done():
+            self._announcement_task.cancel()
 
     def is_busy(self) -> bool:
         return self._reply_in_progress or (self._music_task is not None and not self._music_task.done())
@@ -200,22 +228,44 @@ class Session:
         """Speaks `text` with no LLM/STT involvement -- used by the
         proactive-event announcer (event_bus.py's consumer, wired up in
         Task 7), never by a normal user turn. Callers are responsible for
-        checking is_busy() first; this method does not check it itself,
-        so it can also be used for other non-conversational speech later
-        without re-deriving that policy here.
+        checking is_busy() first as a cheap pre-filter; the actual mutual
+        exclusion against a concurrent handle_end_of_speech() call is
+        enforced by self._lock (see its docstring in __init__), acquired
+        here too.
+
+        Runs as its own cancellable task (self._announcement_task) so
+        handle_interrupt() can cut it short if a real user turn (wake
+        word) fires while this is still speaking -- awaited here so
+        callers still see this as one coroutine that completes when the
+        announcement is delivered (or dropped, if interrupted).
         """
-        self._reply_in_progress = True
+        task = asyncio.ensure_future(self._speak_announcement_locked(text))
+        self._announcement_task = task
         try:
-            await self._send_text(protocol.encode_emotion("neutral"))
-            tts_stream = self._tts.synthesize(_single_chunk(text))
-            try:
-                async for chunk in tts_stream:
-                    await self._send_binary(chunk)
-            finally:
-                await tts_stream.aclose()
-            await self._send_text(protocol.encode_response_end())
+            await task
+        except asyncio.CancelledError:
+            # handle_interrupt() cancelled self._announcement_task (not
+            # this coroutine directly) -- swallow it here rather than
+            # letting it propagate to the caller (announcer.py's own
+            # loop), which must keep running afterward.
+            logger.info("proactive announcement interrupted by a user turn")
         finally:
-            self._reply_in_progress = False
+            self._announcement_task = None
+
+    async def _speak_announcement_locked(self, text: str) -> None:
+        async with self._lock:
+            self._reply_in_progress = True
+            try:
+                await self._send_text(protocol.encode_emotion("neutral"))
+                tts_stream = self._tts.synthesize(_single_chunk(text))
+                try:
+                    async for chunk in tts_stream:
+                        await self._send_binary(chunk)
+                finally:
+                    await tts_stream.aclose()
+                await self._send_text(protocol.encode_response_end())
+            finally:
+                self._reply_in_progress = False
 
     async def _play_music(self, transcript: str) -> None:
         if self._navidrome is None:

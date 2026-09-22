@@ -684,3 +684,139 @@ async def test_speak_announcement_sends_tts_audio_and_response_end():
 
     assert sent_binary  # at least one audio chunk was sent
     assert any("response_end" in t for t in sent_text)
+
+
+class GatedTts:
+    """TTS fake whose synthesize() blocks mid-stream on an asyncio.Event
+    until the test releases it -- used to hold Session._lock open long
+    enough that a concurrent caller can be proven to actually block on
+    it, not just win a lucky race. `entered` fires the moment the first
+    chunk is about to be produced (i.e. once the caller is definitely
+    inside the locked section), so a test can wait on that instead of an
+    arbitrary sleep.
+    """
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    def synthesize(self, text_stream):
+        return self._gen(text_stream)
+
+    async def _gen(self, text_stream):
+        async for text in text_stream:
+            self.entered.set()
+            await self.release.wait()
+            yield f"audio:{text}".encode()
+
+
+async def test_speak_announcement_and_a_user_turn_cannot_run_concurrently():
+    # I3: proves the *lock* closes the race, not just is_busy() -- a real
+    # user turn started while speak_announcement() is mid-flight must
+    # block until the announcement's lock is released, rather than
+    # interleaving TTS/WebSocket calls with it.
+    tts = GatedTts()
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        pass
+
+    stt = FakeStt(transcript="ciao come stai")
+    llm = FakeLlm(chunks=["[emotion:neutral] ciao"])
+    session = Session(stt, llm, tts, send_text, send_binary)
+
+    announce_task = asyncio.ensure_future(session.speak_announcement("aggiornamento"))
+    await asyncio.wait_for(tts.entered.wait(), timeout=1.0)  # now inside the locked section
+
+    turn_task = asyncio.ensure_future(session.handle_end_of_speech())
+    await asyncio.sleep(0.02)
+
+    # The user turn must still be stuck waiting on the lock -- it hasn't
+    # even reached its own body (stt.finalize()/llm.stream_reply()) yet.
+    assert not turn_task.done()
+    assert llm.stream_reply_calls == 0
+
+    tts.release.set()  # let the announcement finish and release the lock
+    await announce_task
+    await turn_task
+
+    assert llm.stream_reply_calls == 1
+
+
+async def test_handle_end_of_speech_and_speak_announcement_cannot_run_concurrently_either_order():
+    # Same race, opposite ordering: a user turn already holding the lock
+    # must block a proactive announcement that arrives mid-turn.
+    tts = GatedTts()
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        pass
+
+    stt = FakeStt(transcript="ciao come stai")
+    llm = FakeLlm(chunks=["[emotion:neutral] ciao"])
+    session = Session(stt, llm, tts, send_text, send_binary)
+
+    turn_task = asyncio.ensure_future(session.handle_end_of_speech())
+    await asyncio.wait_for(tts.entered.wait(), timeout=1.0)  # now inside the locked section
+
+    announce_task = asyncio.ensure_future(session.speak_announcement("aggiornamento"))
+    await asyncio.sleep(0.02)
+
+    assert not announce_task.done()
+
+    tts.release.set()
+    await turn_task
+    await announce_task  # completes once the turn releases the lock
+
+
+async def test_handle_interrupt_cancels_an_in_flight_announcement():
+    events: list[tuple[str, object]] = []
+
+    async def send_text(text: str) -> None:
+        events.append(("text", text))
+
+    async def send_binary(data: bytes) -> None:
+        events.append(("binary", data))
+        await asyncio.sleep(0.05)  # simulate real send pacing so there's time to interrupt
+
+    class SlowMultiChunkTts:
+        """Unlike the real TTS engines, yields several binary chunks per
+        single text chunk -- announcements are always a single
+        `_single_chunk(text)` input, so this is needed to have more than
+        one binary frame in flight to interrupt mid-stream."""
+
+        def synthesize(self, text_stream):
+            return self._gen(text_stream)
+
+        async def _gen(self, text_stream):
+            async for _ in text_stream:
+                for chunk in [b"a1", b"a2", b"a3", b"a4"]:
+                    yield chunk
+
+    stt = FakeStt(transcript="")
+    llm = FakeLlm(chunks=[])
+    session = Session(stt, llm, SlowMultiChunkTts(), send_text, send_binary)
+
+    announce_task = asyncio.ensure_future(session.speak_announcement("la build e' fallita"))
+    await asyncio.sleep(0.01)  # let the first chunk or two send
+    assert session._announcement_task is not None
+
+    await session.handle_interrupt()
+    await announce_task  # must NOT raise -- speak_announcement() swallows the cancellation itself
+
+    assert session._announcement_task is None
+    # Interrupted mid-announcement: response_end must NOT have been sent.
+    assert not any(e == ("text", '{"type": "response_end"}') for e in events)
+    # At least one chunk got out before the interrupt landed, proving this
+    # was cancelled mid-stream rather than never starting.
+    assert any(e[0] == "binary" for e in events)
+
+
+async def test_handle_interrupt_with_no_active_announcement_is_a_no_op():
+    session, *_ = _make_session(llm_chunks=[])
+
+    await session.handle_interrupt()  # must not raise (covers both music and announcement branches)
