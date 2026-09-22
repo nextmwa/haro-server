@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS event_state (
+    source_key TEXT PRIMARY KEY,
+    dedup_key TEXT NOT NULL
+);
 """
 
 
@@ -143,6 +148,30 @@ def set_config_value(db_path: str, key: str, value: str) -> None:
         conn.execute(
             "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_event_dedup_key(db_path: str, source_key: str) -> str | None:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT dedup_key FROM event_state WHERE source_key = ?", (source_key,)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def set_event_dedup_key(db_path: str, source_key: str, dedup_key: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO event_state (source_key, dedup_key) VALUES (?, ?) "
+            "ON CONFLICT(source_key) DO UPDATE SET dedup_key = excluded.dedup_key",
+            (source_key, dedup_key),
         )
         conn.commit()
     finally:

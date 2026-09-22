@@ -67,3 +67,16 @@ def test_config_value_roundtrip(tmp_path):
 
     db.set_config_value(path, "system_prompt", "Prompt aggiornato.")
     assert db.get_config_value(path, "system_prompt") == "Prompt aggiornato."
+
+
+def test_event_dedup_key_round_trips(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db.init_db(db_path)
+
+    assert db.get_event_dedup_key(db_path, "github:acme/web:pr") is None
+
+    db.set_event_dedup_key(db_path, "github:acme/web:pr", "42")
+    assert db.get_event_dedup_key(db_path, "github:acme/web:pr") == "42"
+
+    db.set_event_dedup_key(db_path, "github:acme/web:pr", "43")
+    assert db.get_event_dedup_key(db_path, "github:acme/web:pr") == "43"
