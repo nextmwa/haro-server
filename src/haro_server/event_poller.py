@@ -1,3 +1,4 @@
+import datetime
 import logging
 
 import httpx
@@ -78,5 +79,45 @@ async def _poll_one_repo(
                     )
                 )
             db.set_event_dedup_key(db_path, ci_key, overall)
+
+    return events
+
+
+async def poll_calendar(service, db_path: str, lookahead_minutes: int = 15) -> list[Event]:
+    """`service` is a Google Calendar API v3 resource, as returned by
+    `googleapiclient.discovery.build("calendar", "v3", credentials=...)`
+    -- built once at server startup (Task 10) and passed in here, not
+    constructed by this function, so tests can inject a fake with the
+    same `.events().list(**kwargs).execute()` shape. Never raises: same
+    "log and skip this cycle" policy as poll_github above.
+    """
+    try:
+        now = datetime.datetime.now(datetime.UTC)
+        time_max = now + datetime.timedelta(minutes=lookahead_minutes)
+        response = service.events().list(
+            calendarId="primary",
+            timeMin=now.isoformat(),
+            timeMax=time_max.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+    except Exception:
+        logger.exception("Calendar poll failed, skipping this cycle")
+        return []
+
+    events: list[Event] = []
+    for item in response.get("items", []):
+        dedup_key = f"calendar:primary:{item['id']}"
+        if db.get_event_dedup_key(db_path, dedup_key) is not None:
+            continue
+        summary = item.get("summary", "un evento")
+        events.append(
+            Event(
+                source="calendar",
+                summary=f"tra poco hai: {summary}",
+                dedup_key=dedup_key,
+            )
+        )
+        db.set_event_dedup_key(db_path, dedup_key, "notified")
 
     return events

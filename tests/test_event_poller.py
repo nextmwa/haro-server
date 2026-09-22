@@ -1,8 +1,9 @@
+import datetime
 import httpx
 import pytest
 
 from haro_server import db
-from haro_server.event_poller import poll_github
+from haro_server.event_poller import poll_github, poll_calendar
 
 
 class FakeGithubTransport(httpx.MockTransport):
@@ -52,3 +53,55 @@ async def test_poll_github_reports_a_failed_check_run(tmp_path):
 
     assert len(events) == 1
     assert "fallit" in events[0].summary.lower()
+
+
+class FakeCalendarEventsList:
+    def __init__(self, items: list[dict]) -> None:
+        self._items = items
+
+    def execute(self):
+        return {"items": self._items}
+
+
+class FakeCalendarEvents:
+    def __init__(self, items: list[dict]) -> None:
+        self._items = items
+
+    def list(self, **kwargs):
+        return FakeCalendarEventsList(self._items)
+
+
+class FakeCalendarService:
+    def __init__(self, items: list[dict]) -> None:
+        self._items = items
+
+    def events(self):
+        return FakeCalendarEvents(self._items)
+
+
+def _soon_iso(minutes: int) -> str:
+    return (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=minutes)).isoformat()
+
+
+async def test_poll_calendar_reports_an_upcoming_meeting(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db.init_db(db_path)
+    service = FakeCalendarService(
+        items=[{"id": "evt1", "summary": "Standup", "start": {"dateTime": _soon_iso(10)}}]
+    )
+    events = await poll_calendar(service, db_path)
+
+    assert len(events) == 1
+    assert "Standup" in events[0].summary
+
+
+async def test_poll_calendar_does_not_repeat_an_already_notified_meeting(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db.init_db(db_path)
+    service = FakeCalendarService(
+        items=[{"id": "evt1", "summary": "Standup", "start": {"dateTime": _soon_iso(10)}}]
+    )
+    await poll_calendar(service, db_path)
+    events = await poll_calendar(service, db_path)
+
+    assert events == []

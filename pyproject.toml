@@ -18,6 +18,13 @@ dependencies = [
     # stream) needs an async HTTP client -- httpx, not requests, since the
     # whole server is asyncio-based throughout.
     "httpx>=0.27.0",
+    # event_poller.py's Calendar polling needs real OAuth token refresh
+    # handling, which google-api-python-client/google-auth provide
+    # correctly -- unlike GitHub's poller (a static PAT over plain httpx),
+    # hand-rolling OAuth refresh here would be a real correctness risk for
+    # little benefit.
+    "google-api-python-client>=2.100.0",
+    "google-auth>=2.23.0",
     # face_tracking.py's server-side face detection (moved here from the
     # ESP32 firmware: the on-device esp-dl models either missed faces
     # unreliably (2-stage MSRMNP) or crashed the board with ESP_ERR_NO_MEM
