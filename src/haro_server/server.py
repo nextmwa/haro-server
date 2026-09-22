@@ -6,8 +6,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from . import camera_preview, db, face_tracking, protocol
 from .admin import create_admin_router
+from .announcer import run_announcer
 from .chatterbox_tts import ChatterboxTtsEngine
 from .config import Config
+from .event_bus import EventBus
+from .event_poller import poll_calendar, poll_github
 from .llm import LiteLlmClient
 from .navidrome import NavidromeClient
 from .pockettts_tts import PocketTtsEngine
@@ -75,6 +78,49 @@ def create_app(config: Config) -> FastAPI:
     else:
         logger.info("Navidrome not configured -- music requests will get an error reply")
 
+    event_bus = EventBus()
+    active_session: Session | None = None
+
+    def get_active_session() -> Session | None:
+        return active_session
+
+    async def run_scheduler() -> None:
+        calendar_service = None
+        if config.google_calendar_credentials_path:
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
+
+            credentials = Credentials.from_authorized_user_file(config.google_calendar_credentials_path)
+            calendar_service = build("calendar", "v3", credentials=credentials)
+
+        import httpx
+
+        async with httpx.AsyncClient(base_url="https://api.github.com") as client:
+            while True:
+                if config.github_token and config.github_repos:
+                    for event in await poll_github(
+                        client, config.db_path, config.github_token, config.github_repos
+                    ):
+                        event_bus.publish(event)
+                if calendar_service is not None:
+                    for event in await poll_calendar(calendar_service, config.db_path):
+                        event_bus.publish(event)
+                await asyncio.sleep(config.event_poll_interval_seconds)
+
+    @app.on_event("startup")
+    async def _start_background_event_tasks() -> None:
+        # Registered here (not called directly in create_app()'s body)
+        # because create_app() runs before uvicorn's event loop exists --
+        # see this task's Context note. FastAPI runs every "startup"
+        # handler once that loop is actually up, which is the earliest
+        # point asyncio.create_task() is legal here.
+        if config.github_token or config.google_calendar_credentials_path:
+            asyncio.create_task(run_scheduler())
+            asyncio.create_task(run_announcer(event_bus, get_active_session))
+            logger.info("proactive event polling started (interval=%ds)", config.event_poll_interval_seconds)
+        else:
+            logger.info("no GitHub token or Calendar credentials configured -- proactive events disabled")
+
     @app.websocket("/")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
@@ -91,12 +137,15 @@ def create_app(config: Config) -> FastAPI:
             await websocket.send_bytes(data)
 
         session = Session(stt, llm, tts, send_text, send_binary, db_path=config.db_path, navidrome=navidrome)
+        nonlocal active_session
+        active_session = session
 
         try:
             while True:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
                     logger.info("session %s disconnected", session.session_id)
+                    active_session = None
                     break
                 if "text" in message and message["text"] is not None:
                     try:
@@ -151,5 +200,6 @@ def create_app(config: Config) -> FastAPI:
             # actually handles the normal disconnect case with the raw
             # receive() loop used here.
             logger.info("session %s disconnected", session.session_id)
+            active_session = None
 
     return app
