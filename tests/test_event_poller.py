@@ -1,6 +1,5 @@
 import datetime
 import httpx
-import pytest
 
 from haro_server import db
 from haro_server.event_poller import poll_github, poll_calendar
@@ -20,15 +19,38 @@ class FakeGithubTransport(httpx.MockTransport):
         super().__init__(handler)
 
 
-async def test_poll_github_reports_a_new_open_pr(tmp_path):
+async def test_poll_github_seeds_the_watermark_on_cold_start_without_announcing(tmp_path):
+    # First-ever poll of a repo: every currently-open PR must NOT be
+    # announced (they aren't "new", the poller just hasn't seen this repo
+    # before) -- only the watermark is seeded.
     db_path = str(tmp_path / "test.db")
     db.init_db(db_path)
     transport = FakeGithubTransport(pulls=[{"number": 42, "title": "Fix bug"}], check_runs=[])
     async with httpx.AsyncClient(transport=transport, base_url="https://api.github.com") as client:
         events = await poll_github(client, db_path, token="fake-token", repos=["acme/web"])
 
+    assert events == []
+    assert db.get_event_dedup_key(db_path, "github:acme/web:pr") == "42"
+
+
+async def test_poll_github_reports_a_new_open_pr_after_the_watermark_is_seeded(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db.init_db(db_path)
+    # Cycle 1: cold start, seeds the watermark at PR 42, announces nothing.
+    transport = FakeGithubTransport(pulls=[{"number": 42, "title": "Fix bug"}], check_runs=[])
+    async with httpx.AsyncClient(transport=transport, base_url="https://api.github.com") as client:
+        await poll_github(client, db_path, token="fake-token", repos=["acme/web"])
+
+    # Cycle 2: a genuinely new PR appears -- this one is announced.
+    transport2 = FakeGithubTransport(
+        pulls=[{"number": 42, "title": "Fix bug"}, {"number": 43, "title": "Add feature"}],
+        check_runs=[],
+    )
+    async with httpx.AsyncClient(transport=transport2, base_url="https://api.github.com") as client:
+        events = await poll_github(client, db_path, token="fake-token", repos=["acme/web"])
+
     assert len(events) == 1
-    assert "42" in events[0].summary or "Fix bug" in events[0].summary
+    assert "43" in events[0].summary or "Add feature" in events[0].summary
 
 
 async def test_poll_github_does_not_repeat_an_already_seen_pr(tmp_path):

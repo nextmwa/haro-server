@@ -1,6 +1,12 @@
 import dataclasses
 import os
 
+_SECRET_FIELD_SUFFIXES = ("_token", "_key", "_password")
+
+
+def _looks_like_a_secret_field(field_name: str) -> bool:
+    return field_name.endswith(_SECRET_FIELD_SUFFIXES)
+
 
 @dataclasses.dataclass
 class Config:
@@ -41,6 +47,23 @@ class Config:
     # means Calendar polling is inactive.
     google_calendar_credentials_path: str | None = None
     event_poll_interval_seconds: int = 180
+
+    def __repr__(self) -> str:
+        # The default dataclass __repr__ would print every secret field
+        # (github_token, anthropic_api_key, navidrome_password, ...) in
+        # full if this object is ever logged (e.g. an unhandled exception
+        # that includes local variables, or a stray `logger.debug(config)`
+        # somewhere). Redact anything field-name-shaped like a secret
+        # instead of trusting every call site to remember not to log it.
+        parts = []
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if _looks_like_a_secret_field(field.name) and value:
+                value = "<redacted>"
+            parts.append(f"{field.name}={value!r}")
+        return f"{type(self).__name__}({', '.join(parts)})"
+
+    __str__ = __repr__
 
     @staticmethod
     def from_env() -> "Config":

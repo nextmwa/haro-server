@@ -118,13 +118,37 @@ class LiteLlmClient:
         )
         message = decision.choices[0].message
         if not message.tool_calls:
-            if message.content:
-                yield message.content
+            # No tool needed for this turn (e.g. "ciao", "che ore sono")
+            # -- make a second, streamed call instead of returning the
+            # decision call's non-streamed message.content as one whole
+            # chunk. Without this, EVERY turn pays for time-to-first-audio
+            # as if it needed a tool just because GITHUB_TOKEN happens to
+            # be configured -- see I7 in the final review. This still
+            # costs two round trips overall (the decision call is
+            # unavoidable to know whether a tool is needed at all), but
+            # the reply itself streams normally instead of arriving as
+            # one late blob.
+            response = await litellm.acompletion(model=self._model, messages=messages, stream=True)
+            async for chunk in response:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
             return
 
         messages.append(message.model_dump())
         for tool_call in message.tool_calls:
-            result = await self._call_tool(tool_call)
+            try:
+                result = await self._call_tool(tool_call)
+            except Exception as exc:
+                # The MCP server can die mid-session, the GitHub API can
+                # error out, etc. -- letting this propagate out of this
+                # async generator turns it into session.py's generic
+                # "internal error during turn" with no spoken reply at
+                # all. Feed the model an error string instead so it can
+                # tell the user something sensible in its own reply (e.g.
+                # "non riesco a leggere GitHub adesso").
+                logger.exception("tool call failed: %s", getattr(tool_call, "id", "?"))
+                result = f"Error calling tool: {exc}"
             messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
 
         # Follow-up call, no tools offered this time -- a plain streamed

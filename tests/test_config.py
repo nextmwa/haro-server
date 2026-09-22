@@ -53,3 +53,36 @@ def test_config_from_env_reads_github_repos_as_a_comma_separated_list(monkeypatc
     config = Config.from_env()
     assert config.github_token == "ghp_fake"
     assert config.github_repos == ["acme/web", "acme/api"]
+
+
+def test_repr_redacts_every_secret_shaped_field():
+    config = Config(
+        anthropic_api_key="sk-ant-secret",
+        openai_api_key="sk-openai-secret",
+        gemini_api_key="gemini-secret",
+        admin_password="admin-secret",
+        navidrome_password="navidrome-secret",
+        github_token="ghp_secret",
+    )
+
+    text = repr(config)
+
+    for secret in [
+        "sk-ant-secret",
+        "sk-openai-secret",
+        "gemini-secret",
+        "admin-secret",
+        "navidrome-secret",
+        "ghp_secret",
+    ]:
+        assert secret not in text
+    assert text.count("<redacted>") == 6
+    # Non-secret fields still show through -- redaction shouldn't turn
+    # this into an opaque blob that's useless for debugging.
+    assert "default_model='claude-sonnet-5'" in text
+
+
+def test_repr_leaves_unset_secret_fields_as_none_not_redacted():
+    config = Config()
+    assert "github_token=None" in repr(config)
+    assert "<redacted>" not in repr(config)

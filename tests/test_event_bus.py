@@ -1,7 +1,5 @@
 import asyncio
 
-import pytest
-
 from haro_server.event_bus import Event, EventBus
 
 

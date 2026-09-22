@@ -37,20 +37,31 @@ async def _poll_one_repo(
     pulls_resp = await client.get(f"/repos/{repo}/pulls", headers=headers)
     pulls_resp.raise_for_status()
     last_pr_number = db.get_event_dedup_key(db_path, pulls_key)
-    last_pr_number_int = int(last_pr_number) if last_pr_number else 0
-    newest_pr_number = last_pr_number_int
-    for pr in pulls_resp.json():
-        if pr["number"] > last_pr_number_int:
-            events.append(
-                Event(
-                    source="github",
-                    summary=f"nuova pull request su {repo}: {pr['title']}",
-                    dedup_key=f"{pulls_key}:{pr['number']}",
+    if last_pr_number is None:
+        # Cold start (this repo has never been polled before): every
+        # currently-open PR would otherwise look "new" against a watermark
+        # of 0 and get announced all at once. Seed the watermark to the
+        # current max PR number instead, without emitting any events --
+        # only PRs that show up on a LATER cycle (once a real watermark
+        # exists) are genuinely new and worth announcing.
+        pr_numbers = [pr["number"] for pr in pulls_resp.json()]
+        if pr_numbers:
+            db.set_event_dedup_key(db_path, pulls_key, str(max(pr_numbers)))
+    else:
+        last_pr_number_int = int(last_pr_number)
+        newest_pr_number = last_pr_number_int
+        for pr in pulls_resp.json():
+            if pr["number"] > last_pr_number_int:
+                events.append(
+                    Event(
+                        source="github",
+                        summary=f"nuova pull request su {repo}: {pr['title']}",
+                        dedup_key=f"{pulls_key}:{pr['number']}",
+                    )
                 )
-            )
-            newest_pr_number = max(newest_pr_number, pr["number"])
-    if newest_pr_number != last_pr_number_int:
-        db.set_event_dedup_key(db_path, pulls_key, str(newest_pr_number))
+                newest_pr_number = max(newest_pr_number, pr["number"])
+        if newest_pr_number != last_pr_number_int:
+            db.set_event_dedup_key(db_path, pulls_key, str(newest_pr_number))
 
     repo_resp = await client.get(f"/repos/{repo}", headers=headers)
     repo_resp.raise_for_status()

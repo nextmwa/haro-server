@@ -51,10 +51,26 @@ async def run_announcer(
             continue
 
         session = get_active_session()
-        if session is None or session.is_busy():
-            # Still busy (or nothing connected) -- keep pending queued
-            # and retry at poll_interval_seconds, without spinning the
-            # loop or re-blocking on the next event indefinitely.
+        if session is None:
+            # No connected session at all: per the design spec's Error
+            # Handling section, this is a single delivery attempt, not a
+            # queue -- there's nothing to wait for here (no robot could
+            # reconnect and retroactively receive this), so drop `pending`
+            # instead of holding it forever. Each event's dedup_key is
+            # already marked seen by the poller that produced it, so
+            # dropping it here doesn't cause it to reappear on the next
+            # poll cycle.
+            logger.info(
+                "dropping %d queued announcement(s): no connected session", len(pending)
+            )
+            pending = []
+            continue
+        if session.is_busy():
+            # Busy (mid-reply or mid-track), but a session IS connected --
+            # unlike the no-session case above, this is worth waiting out:
+            # keep pending queued and retry at poll_interval_seconds,
+            # without spinning the loop or re-blocking on the next event
+            # indefinitely.
             await asyncio.sleep(poll_interval_seconds)
             continue
 
@@ -71,8 +87,18 @@ async def run_announcer(
             logger.exception("failed to deliver a proactive announcement, dropping it")
 
 
+_MAX_COMBINED_SUMMARIES = 3
+
+
 def _combine(events: list[Event]) -> str:
     if len(events) == 1:
         return events[0].summary
-    joined = "; ".join(e.summary for e in events)
+    shown = events[:_MAX_COMBINED_SUMMARIES]
+    joined = "; ".join(e.summary for e in shown)
+    remaining = len(events) - len(shown)
+    if remaining > 0:
+        # Even after the cold-start fix (I6), a burst of many events in
+        # one cycle shouldn't turn into an unbounded monologue -- list the
+        # first few and summarize the rest by count.
+        return f"Ci sono {len(events)} aggiornamenti: {joined}; e altri {remaining}"
     return f"Ci sono {len(events)} aggiornamenti: {joined}"

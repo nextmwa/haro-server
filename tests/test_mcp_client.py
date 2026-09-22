@@ -1,7 +1,5 @@
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 from haro_server.mcp_client import McpToolClient
 
 

@@ -277,6 +277,31 @@ async def test_stream_reply_without_tools_is_unchanged(tmp_path):
     assert "tools" not in mock_acompletion.call_args.kwargs
 
 
+async def test_stream_reply_streams_the_reply_when_tools_configured_but_none_needed(tmp_path):
+    # I7: a turn that doesn't need a tool (e.g. "ciao") must still get a
+    # STREAMED reply even with tools configured -- not the decision
+    # call's non-streamed message.content returned as one whole chunk,
+    # which would kill time-to-first-audio for every turn just because
+    # GITHUB_TOKEN happens to be set.
+    decision_response = FakeCompletion("")  # message.content falsy, tool_calls=None
+    client = _client(tmp_path)
+    client.set_tools(
+        tools=[{"type": "function", "function": {"name": "list_pull_requests"}}],
+        call_tool=AsyncMock(),
+    )
+
+    with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
+        mock_acompletion.side_effect = [decision_response, _fake_stream(["[emotion:neutral] ciao"])]
+        chunks = [c async for c in client.stream_reply("ciao")]
+
+    assert "".join(chunks) == "[emotion:neutral] ciao"
+    assert mock_acompletion.call_count == 2  # decision call + streamed follow-up
+    first_call, second_call = mock_acompletion.call_args_list
+    assert first_call.kwargs["stream"] is False
+    assert second_call.kwargs["stream"] is True
+    assert "tools" not in second_call.kwargs
+
+
 async def test_stream_reply_calls_a_tool_when_the_model_requests_one(tmp_path):
     fake_tool_call = FakeToolCall(id="call_1", name="list_pull_requests")
     decision_response = FakeCompletion("")
@@ -306,3 +331,37 @@ async def test_stream_reply_calls_a_tool_when_the_model_requests_one(tmp_path):
     assert first_call.kwargs["stream"] is False
     assert second_call.kwargs["stream"] is True
     assert "tool_call_id" in str(second_call.kwargs["messages"])  # the tool result was folded in
+
+
+async def test_stream_reply_feeds_an_error_string_back_when_a_tool_call_raises(tmp_path):
+    # A raising tool call (MCP server died, GitHub API error) must not
+    # propagate out of this async generator uncaught -- session.py would
+    # turn that into a generic "internal error during turn" with no
+    # spoken reply at all. It should instead become a "tool" message the
+    # model can react to in its own reply.
+    fake_tool_call = FakeToolCall(id="call_1", name="list_pull_requests")
+    decision_response = FakeCompletion("")
+    decision_response.choices[0].message = FakeToolCallMessage([fake_tool_call])
+
+    async def failing_call_tool(tool_call):
+        raise RuntimeError("MCP server died")
+
+    client = _client(tmp_path)
+    client.set_tools(
+        tools=[{"type": "function", "function": {"name": "list_pull_requests"}}],
+        call_tool=failing_call_tool,
+    )
+
+    with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
+        mock_acompletion.side_effect = [
+            decision_response,
+            _fake_stream(["[emotion:sad] non riesco a leggere GitHub adesso"]),
+        ]
+        chunks = [c async for c in client.stream_reply("ho PR aperte?")]
+
+    assert "".join(chunks) == "[emotion:sad] non riesco a leggere GitHub adesso"
+    second_call = mock_acompletion.call_args_list[1]
+    tool_messages = [m for m in second_call.kwargs["messages"] if m.get("role") == "tool"]
+    assert len(tool_messages) == 1
+    assert "Error calling tool" in tool_messages[0]["content"]
+    assert "MCP server died" in tool_messages[0]["content"]
