@@ -226,18 +226,18 @@ git commit -m "feat: add event_state table for poller dedup tracking"
 - Consumes: nothing new from other tasks.
 - Produces: `Session.is_busy() -> bool`, `async def Session.speak_announcement(self, text: str) -> None`. Later tasks (the announcer, Task 7) call both.
 
-**Context:** `Session.handle_end_of_speech()` currently has no "a reply is in progress" flag at all -- read `src/haro_server/session.py` in full before starting (already read during planning; the relevant pieces are `__init__`, `handle_end_of_speech()`, and the music branch's `self._music_task` handling). Music plays via a background task (`self._music_task`) that outlives `handle_end_of_speech()`'s own return, so "busy" must check both: whether `handle_end_of_speech()`'s own reply work is in flight, AND whether `self._music_task` is set and not done.
+**Context:** `Session.handle_end_of_speech()` currently has no "a reply is in progress" flag at all -- read `src/haro_server/session.py` in full before starting. Its real signature is `Session(stt, llm, tts, send_text, send_binary, db_path=None, navidrome=None)`, and `handle_end_of_speech()` has **four** exit paths from one `async def`: an empty-transcript early return, a deterministic-action early return, a music-request early return (spawns `self._music_task` and returns without awaiting it), and the normal LLM/TTS streaming path at the end. Music plays via that background task (`self._music_task`, already set up by earlier work on this branch), which outlives `handle_end_of_speech()`'s own return -- so "busy" must check both: whether `handle_end_of_speech()`'s own synchronous work is in flight (covers all four exit paths), AND whether `self._music_task` is set and not done (covers a track still playing after the method already returned).
+
+Reuse this file's real `_make_session(llm_chunks, sent_text=None, sent_binary=None)` helper (not a hypothetical `make_session`) -- it returns the 6-tuple `(session, stt, llm, tts, sent_text, sent_binary)` and already gives you the two capturing lists `speak_announcement()`'s test needs, so there is no need to reassign `session._send_binary`/`_send_text` by hand.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# Append to tests/test_session.py -- reuses this file's existing FakeStt/FakeLlm/FakeTts
-# fake classes and make_session() helper (check the top of the file for their
-# exact names before writing this -- match whatever helper already builds a
-# Session from fakes for the other tests in this file, do not write a second one).
+# Append to tests/test_session.py -- reuses this file's real _make_session(),
+# FakeLlm classes.
 
 async def test_is_busy_false_before_any_turn():
-    session = make_session(llm_chunks=["[emotion:neutral] ciao"])
+    session, *_ = _make_session(llm_chunks=["[emotion:neutral] ciao"])
     assert session.is_busy() is False
 
 
@@ -246,24 +246,49 @@ async def test_is_busy_true_during_a_normal_reply():
     # handle_end_of_speech() is still awaiting the TTS stream.
     busy_during_reply = []
 
+    session, stt, llm, tts, sent_text, sent_binary = _make_session(llm_chunks=[])
+
     class SlowLlm(FakeLlm):
         async def _chunk_generator(self):
             busy_during_reply.append(session.is_busy())
             yield "[emotion:neutral] ciao"
 
-    session = make_session(llm=SlowLlm(chunks=[]))
+    session._llm = SlowLlm(chunks=[])
     await session.handle_end_of_speech()
 
     assert busy_during_reply == [True]
     assert session.is_busy() is False  # cleared once the turn finished
 
 
+async def test_is_busy_true_while_a_music_track_is_still_playing():
+    # handle_end_of_speech() returns immediately for a music request
+    # (see session.py's own comment on why) -- is_busy() must still
+    # report True while the background _music_task it spawned is
+    # running, not just while handle_end_of_speech() itself is on the
+    # stack.
+    stt = FakeStt(transcript="metti musica")
+    track = FakeTrack(id="song-1", title="Some Song", artist="Some Artist")
+    llm = FakeLlm(chunks=[], music_query="musica", picked_track_index=0)
+    navidrome = FakeNavidrome(search_results=[track], pcm_chunks=[b"pcm1", b"pcm2"])
+    tts = FakeTts()
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        pass
+
+    session = Session(stt, llm, tts, send_text, send_binary, navidrome=navidrome)
+
+    await session.handle_end_of_speech()
+    assert session.is_busy() is True  # music_task is running
+
+    await session._music_task
+    assert session.is_busy() is False
+
+
 async def test_speak_announcement_sends_tts_audio_and_response_end():
-    session = make_session()
-    sent_binary = []
-    sent_text = []
-    session._send_binary = _record(sent_binary)
-    session._send_text = _record(sent_text)
+    session, stt, llm, tts, sent_text, sent_binary = _make_session(llm_chunks=[])
 
     await session.speak_announcement("la build e' fallita")
 
@@ -271,7 +296,7 @@ async def test_speak_announcement_sends_tts_audio_and_response_end():
     assert any("response_end" in t for t in sent_text)
 ```
 
-(`_record` is a tiny helper -- if this file doesn't already have one, add it near the top: `def _record(sink):\n    async def _fn(x):\n        sink.append(x)\n    return _fn`. If a similar helper already exists under a different name, use that one instead of adding a duplicate.)
+(`test_is_busy_true_while_a_music_track_is_still_playing` needs `FakeStt`, `Session`, `FakeNavidrome`, `FakeTrack` -- all already defined at module level in this same file, so no extra import is needed.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -290,18 +315,62 @@ In `src/haro_server/session.py`, in `Session.__init__`, add after `self._music_t
         self._reply_in_progress = False
 ```
 
-Wrap `handle_end_of_speech()`'s existing body in a try/finally (minimal diff: rename nothing, just add the flag at the top and a finally at the very end):
+`handle_end_of_speech()` has four exit points (empty-transcript return, action-match return, music-request return, and falling off the end of the normal-reply path), so the flag must be set before ANY of them can run and cleared in a `finally` wrapping the whole body -- not just the final streaming section. Indent the existing body one level under a new `try:` right after `self._reply_in_progress = True`, and add `finally: self._reply_in_progress = False` at the end, at the same indentation as the `try:`. The body's own content does not change, only its indentation:
 
 ```python
     async def handle_end_of_speech(self) -> None:
         self._reply_in_progress = True
         try:
             transcript = await self._stt.finalize()
-            # ...unchanged body below this line, all the way to the end of the
-            # existing function...
+            logger.debug("transcript: %s", transcript)
+
+            if not transcript.strip():
+                logger.info("empty transcript, skipping LLM/TTS turn")
+                await self._send_text(protocol.encode_response_end())
+                return
+
+            action = actions.match_action(transcript)
+            if action is not None:
+                result = action.resolve()
+                logger.info("action matched: %s -> %r", action.name, result)
+                await self._send_text(protocol.encode_action(action.name, result))
+                await self._send_text(protocol.encode_response_end())
+                self._save_transcript(transcript, reply=f"[azione: {action.name} -> {result}]", emotion=None)
+                return
+
+            if music.is_music_request(transcript):
+                if self._music_task is not None and not self._music_task.done():
+                    self._music_task.cancel()
+                self._music_task = asyncio.create_task(self._play_music(transcript))
+                return
+
+            raw_reply = self._llm.stream_reply(transcript)
+            emotion, text_stream = await _split_emotion_prefix(raw_reply)
+            await self._send_text(protocol.encode_emotion(emotion))
+
+            reply_parts: list[str] = []
+            teed_stream = _tee(text_stream, reply_parts)
+
+            tts_stream = self._tts.synthesize(teed_stream)
+            try:
+                async for chunk in tts_stream:
+                    await self._send_binary(chunk)
+            finally:
+                await tts_stream.aclose()
+                await teed_stream.aclose()
+                await text_stream.aclose()
+                await raw_reply.aclose()
+
+            await self._send_text(protocol.encode_response_end())
+
+            full_reply = "".join(reply_parts)
+            self._save_transcript(transcript, full_reply, emotion)
+            self._spawn_fact_extraction(transcript, full_reply)
         finally:
             self._reply_in_progress = False
 ```
+
+(The comments already on this method in the real file are unchanged -- they're omitted above only to keep this block focused on the indentation/wrapping change; keep them in place when editing the real file, don't delete them.)
 
 Add two new methods after `handle_interrupt()`:
 
@@ -341,7 +410,7 @@ async def _single_chunk(text: str) -> AsyncIterator[str]:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/test_session.py -v`
-Expected: PASS (all tests in the file, including the 3 new ones)
+Expected: PASS (all tests in the file, including the 4 new ones)
 
 - [ ] **Step 5: Commit**
 
@@ -787,7 +856,7 @@ git commit -m "feat: add GitHub/Calendar configuration"
 - Consumes: `EventBus`/`Event` (Task 1), `Session.is_busy()`/`speak_announcement()` (Task 3), `poll_github`/`poll_calendar` (Tasks 4-5), `Config` fields (Task 6).
 - Produces: `run_announcer(bus: EventBus, get_active_session: Callable[[], Session | None], poll_interval_seconds: float = 1.0) -> None` in `announcer.py` -- a standalone, unit-tested function (also infinite, meant to be run as a background task). `get_active_session` returns the currently-connected session, or `None` if the device isn't connected -- `server.py` already only ever holds one live `Session` at a time (one robot, one connection), so a simple accessor is enough; no session registry is needed. The scheduler (the poll-and-publish loop) is **not** a standalone function -- Step 5 below defines it as a `run_scheduler()` closure inline inside `create_app()`, capturing `event_bus`/`config` from the enclosing scope, since it is pure wiring with no independent unit test of its own (Tasks 4-5 already cover `poll_github`/`poll_calendar` in isolation).
 
-**Context:** `server.py`'s `create_app()` currently builds `stt`/`tts`/`llm`/`navidrome` once at startup and constructs a fresh `Session` per WebSocket connection inside `websocket_endpoint()`. This task adds two long-running background tasks started once at app startup (via FastAPI's lifespan, not per-connection), and a small piece of shared state so the announcer can find the currently-connected session. Read `src/haro_server/server.py` in full before starting.
+**Context:** `server.py`'s `create_app()` currently builds `stt`/`tts`/`llm`/`navidrome` once at startup and constructs a fresh `Session` per WebSocket connection inside `websocket_endpoint()`. Critically, `create_app()` itself is a plain (non-`async`) function, called from `main.py` as `app = create_app(config)` *before* `uvicorn.run(app, ...)` starts the event loop -- there is no running loop yet at that point, so `asyncio.create_task(...)` cannot be called directly inside `create_app()`'s body (it would raise `RuntimeError: no running event loop`). The background tasks this step adds must instead be started from a FastAPI startup event handler (`@app.on_event("startup")`), which FastAPI runs once uvicorn's loop is actually running -- registered as a nested function inside `create_app()`, the same closure style `websocket_endpoint()` already uses. Read `src/haro_server/server.py` in full before starting.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -981,12 +1050,19 @@ Inside `create_app()`, after the existing `navidrome` block and before the `@app
                         event_bus.publish(event)
                 await asyncio.sleep(config.event_poll_interval_seconds)
 
-    if config.github_token or config.google_calendar_credentials_path:
-        asyncio.create_task(run_scheduler())
-        asyncio.create_task(run_announcer(event_bus, get_active_session))
-        logger.info("proactive event polling started (interval=%ds)", config.event_poll_interval_seconds)
-    else:
-        logger.info("no GitHub token or Calendar credentials configured -- proactive events disabled")
+    @app.on_event("startup")
+    async def _start_background_event_tasks() -> None:
+        # Registered here (not called directly in create_app()'s body)
+        # because create_app() runs before uvicorn's event loop exists --
+        # see this task's Context note. FastAPI runs every "startup"
+        # handler once that loop is actually up, which is the earliest
+        # point asyncio.create_task() is legal here.
+        if config.github_token or config.google_calendar_credentials_path:
+            asyncio.create_task(run_scheduler())
+            asyncio.create_task(run_announcer(event_bus, get_active_session))
+            logger.info("proactive event polling started (interval=%ds)", config.event_poll_interval_seconds)
+        else:
+            logger.info("no GitHub token or Calendar credentials configured -- proactive events disabled")
 ```
 
 Inside `websocket_endpoint()`, right after `session = Session(...)` is constructed, add:
@@ -996,10 +1072,20 @@ Inside `websocket_endpoint()`, right after `session = Session(...)` is construct
         active_session = session
 ```
 
-And in the existing `finally`/disconnect handling at the end of `websocket_endpoint()` (where the function already logs `"session %s disconnected"`), add right before or after that log line:
+`websocket_endpoint()` has two places that log `"session %s disconnected"` -- the normal-disconnect branch inside the receive loop (`if message["type"] == "websocket.disconnect": logger.info(...); break`) and the `except WebSocketDisconnect:` fallback handler below the loop. Add `active_session = None` right after the `logger.info(...)` call at **both** sites (each already runs inside `websocket_endpoint()`, so `nonlocal active_session` from the assignment above already covers them -- no second `nonlocal` declaration needed):
 
 ```python
-        active_session = None
+                    logger.info("session %s disconnected", session.session_id)
+                    active_session = None
+                    break
+```
+
+and
+
+```python
+        except WebSocketDisconnect:
+            logger.info("session %s disconnected", session.session_id)
+            active_session = None
 ```
 
 - [ ] **Step 6: Run the full test suite to check nothing broke**
@@ -1121,90 +1207,104 @@ git commit -m "feat: add MCP client for GitHub's official MCP server"
 
 **Interfaces:**
 - Consumes: `McpToolClient.tools`/`call_tool()` (Task 8).
-- Produces: `LiteLlmClient.__init__` gains an optional `tools: list[dict] | None = None` and `call_tool: Callable[[Any], Awaitable[str]] | None = None` parameter pair. `stream_reply()`'s external contract (`AsyncIterator[str]`) is unchanged.
+- Produces: `LiteLlmClient.__init__` gains an optional `tools: list[dict] | None = None` and `call_tool: Callable[[Any], Awaitable[str]] | None = None` parameter pair, plus a new `LiteLlmClient.set_tools(self, tools: list[dict], call_tool) -> None` method (used by Task 10's server-startup wiring to attach tools *after* construction -- see that task's Context note for why). `stream_reply()`'s external contract (`AsyncIterator[str]`) is unchanged.
 
 **Context:** Read this task's design-spec background carefully: LiteLLM's streaming responses have multiple currently-open upstream bugs around reconstructing `tool_calls` from chunked deltas (verified via real search results at plan-writing time -- e.g. BerriAI/litellm#39796, #17246, and crewAIInc/crewAI#7534, all about dropped/doubled/corrupted streamed tool-call data). To avoid that whole bug class, tool-calling here uses a **non-streamed** `acompletion()` call first (well-established, simple, no known issues) to let the model decide whether to call a tool; only the follow-up reply (once any tool results are in hand, or immediately if no tool was needed) is streamed, exactly like the existing no-tools code path. This means a turn that ends up calling a tool has a longer pause before the reply starts (no partial streaming during the decision step) -- an accepted tradeoff per the design spec, and only for deployments where `GITHUB_TOKEN` is configured at all.
 
+`tests/test_llm.py` already has real fake-response scaffolding for this exact purpose -- `FakeChunk`/`_fake_stream` for a streamed response, `FakeMessage`/`FakeCompletionChoice`/`FakeCompletion` for a non-streamed one, and a `_client(tmp_path, model=...)` helper that builds a `LiteLlmClient` against a real (empty) temp db. Reuse all of them; mocking goes through `unittest.mock.patch("haro_server.llm.litellm.acompletion", new=AsyncMock())`, not `monkeypatch.setattr`, matching every existing test in that file.
+
 - [ ] **Step 1: Write the failing test**
 
-Check `tests/test_llm.py`'s existing pattern for mocking `litellm.acompletion` first (it already has to fake at least one call for the existing `stream_reply`/`extract_facts` tests -- match that mocking approach exactly). Add:
-
 ```python
-async def test_stream_reply_without_tools_is_unchanged(monkeypatch):
+# Append to tests/test_llm.py -- extends the existing FakeMessage to
+# optionally carry tool_calls, and adds one fake tool-call object.
+
+async def test_stream_reply_without_tools_is_unchanged(tmp_path):
     # Existing behavior: no tools configured -> the original single
     # streamed call, no tool-calling machinery involved at all.
-    calls = []
+    client = _client(tmp_path)
 
-    async def fake_acompletion(**kwargs):
-        calls.append(kwargs)
-        assert "tools" not in kwargs
-        return _fake_stream(["[emotion:neutral] ciao"])
+    with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
+        mock_acompletion.return_value = _fake_stream(["[emotion:neutral] ciao"])
+        chunks = [c async for c in client.stream_reply("ciao")]
 
-    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
-    client = LiteLlmClient(model="fake-model", db_path=":memory:")
-
-    chunks = [c async for c in client.stream_reply("ciao")]
     assert "".join(chunks) == "[emotion:neutral] ciao"
-    assert len(calls) == 1
+    assert mock_acompletion.call_count == 1
+    assert "tools" not in mock_acompletion.call_args.kwargs
 
 
-async def test_stream_reply_calls_a_tool_when_the_model_requests_one(monkeypatch):
-    fake_tool_call = _FakeToolCall(id="call_1", name="list_pull_requests")
-    call_log = []
-
-    async def fake_acompletion(**kwargs):
-        call_log.append(kwargs)
-        if kwargs.get("stream"):
-            return _fake_stream(["[emotion:neutral] hai 2 PR aperte"])
-        return _fake_non_streamed_response_with_tool_call(fake_tool_call)
+async def test_stream_reply_calls_a_tool_when_the_model_requests_one(tmp_path):
+    fake_tool_call = FakeToolCall(id="call_1", name="list_pull_requests")
+    decision_response = FakeCompletion("")
+    decision_response.choices[0].message = FakeToolCallMessage([fake_tool_call])
 
     async def fake_call_tool(tool_call):
         assert tool_call is fake_tool_call
         return "2 open pull requests"
 
-    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
-    client = LiteLlmClient(
-        model="fake-model", db_path=":memory:", tools=[{"type": "function", "function": {"name": "list_pull_requests"}}],
+    client = _client(tmp_path)
+    client.set_tools(
+        tools=[{"type": "function", "function": {"name": "list_pull_requests"}}],
         call_tool=fake_call_tool,
     )
 
-    chunks = [c async for c in client.stream_reply("ho PR aperte?")]
+    with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
+        mock_acompletion.side_effect = [
+            decision_response,
+            _fake_stream(["[emotion:neutral] hai 2 PR aperte"]),
+        ]
+        chunks = [c async for c in client.stream_reply("ho PR aperte?")]
+
     assert "".join(chunks) == "[emotion:neutral] hai 2 PR aperte"
-    assert len(call_log) == 2  # one non-streamed decision call, one streamed follow-up
-    assert call_log[0]["tools"] == client._tools
-    assert "tool_call_id" in str(call_log[1]["messages"])  # the tool result was folded in
+    assert mock_acompletion.call_count == 2  # one non-streamed decision call, one streamed follow-up
+    first_call, second_call = mock_acompletion.call_args_list
+    assert first_call.kwargs["tools"] == client._tools
+    assert first_call.kwargs["stream"] is False
+    assert second_call.kwargs["stream"] is True
+    assert "tool_call_id" in str(second_call.kwargs["messages"])  # the tool result was folded in
 ```
 
-Add these small test helpers near the top of `tests/test_llm.py` (or reuse existing ones if this file already has equivalents for building a fake streamed/non-streamed litellm response -- check first):
+Add these small test helpers near the top of `tests/test_llm.py`, alongside the existing `FakeDelta`/`FakeChoice`/`FakeChunk`/`FakeMessage`/`FakeCompletionChoice`/`FakeCompletion` classes:
 
 ```python
-class _FakeToolCall:
-    def __init__(self, id: str, name: str) -> None:
+class FakeToolCall:
+    def __init__(self, id: str, name: str, arguments: str = "{}") -> None:
         self.id = id
-        self.function = type("F", (), {"name": name, "arguments": "{}"})()
+        self.function = FakeToolCallFunction(name, arguments)
 
 
-def _fake_non_streamed_response_with_tool_call(tool_call):
-    message = type("M", (), {"tool_calls": [tool_call], "content": None, "model_dump": lambda self: {"role": "assistant", "tool_calls": [tool_call]}})()
-    choice = type("C", (), {"message": message})()
-    return type("R", (), {"choices": [choice]})()
+class FakeToolCallFunction:
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
 
 
-async def _fake_stream(text_chunks: list[str]):
-    for text in text_chunks:
-        delta = type("D", (), {"content": text})()
-        choice = type("C", (), {"delta": delta})()
-        yield type("Chunk", (), {"choices": [choice]})()
+class FakeToolCallMessage:
+    """Stands in for litellm's assistant message when the model decided
+    to call a tool instead of replying directly -- .content is None (no
+    text yet) and .tool_calls carries what to call. model_dump() only
+    needs to round-trip through stream_reply()'s own messages.append()
+    call, not match litellm's real serialization exactly.
+    """
+
+    def __init__(self, tool_calls: list[FakeToolCall]) -> None:
+        self.content = None
+        self.tool_calls = tool_calls
+
+    def model_dump(self):
+        return {"role": "assistant", "tool_calls": self.tool_calls}
 ```
+
+(The existing `FakeMessage` class has no `tool_calls` attribute -- `stream_reply()`'s new code checks `message.tool_calls` on whatever `decision.choices[0].message` is, so the no-tool-call path (an ordinary `FakeCompletion`/`FakeMessage`, unchanged) needs `tool_calls` to read as falsy. Add `self.tool_calls = None` to `FakeMessage.__init__` so both paths work through the same fake class family without a second one for "no tool call was made".)
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/test_llm.py -k "stream_reply" -v`
-Expected: FAIL with `TypeError: LiteLlmClient.__init__() got an unexpected keyword argument 'tools'`
+Expected: FAIL with `AttributeError: 'LiteLlmClient' object has no attribute 'set_tools'`
 
 - [ ] **Step 3: Write minimal implementation**
 
-In `src/haro_server/llm.py`, modify `LiteLlmClient.__init__` and `stream_reply`:
+In `src/haro_server/llm.py`, modify `LiteLlmClient.__init__`, add `set_tools`, and modify `stream_reply`:
 
 ```python
     def __init__(
@@ -1216,6 +1316,17 @@ In `src/haro_server/llm.py`, modify `LiteLlmClient.__init__` and `stream_reply`:
     ) -> None:
         self._model = model
         self._db_path = db_path
+        self._tools = tools
+        self._call_tool = call_tool
+
+    def set_tools(self, tools: list[dict], call_tool) -> None:
+        """Attaches MCP tools after construction -- server.py's startup
+        event (Task 10) connects to the MCP server asynchronously, which
+        can only happen once uvicorn's event loop is running, by which
+        point this object already exists. The constructor's tools/
+        call_tool parameters above stay for tests and any future case
+        that has tools available up front.
+        """
         self._tools = tools
         self._call_tool = call_tool
 
@@ -1279,29 +1390,29 @@ git commit -m "feat: add MCP tool-calling to LiteLlmClient.stream_reply()"
 - Modify: `src/haro_server/server.py`
 
 **Interfaces:**
-- Consumes: `McpToolClient` (Task 8), `LiteLlmClient`'s new `tools`/`call_tool` parameters (Task 9).
+- Consumes: `McpToolClient` (Task 8), `LiteLlmClient.set_tools()` (Task 9).
+
+**Context:** Like Task 7's scheduler/announcer, `McpToolClient.connect()` is async and needs a running event loop, but `create_app()` runs before uvicorn's loop exists (see Task 7's Context note -- same constraint, same fix: a FastAPI startup event handler, not a direct call in `create_app()`'s body). `llm = LiteLlmClient(...)` is therefore still constructed synchronously, without tools, exactly as today; the MCP connection and `llm.set_tools(...)` call happen later, from a second `@app.on_event("startup")` handler alongside Task 7's.
 
 - [ ] **Step 1: Update `create_app()`**
 
-In `src/haro_server/server.py`, near where `llm = LiteLlmClient(...)` is currently constructed, change it to:
+In `src/haro_server/server.py`, `llm = LiteLlmClient(model=config.default_model, db_path=config.db_path)`'s construction line does not change. Add, right after Task 7's `_start_background_event_tasks` startup handler (same indentation, same place inside `create_app()`, before the `@app.websocket("/")` decorator):
 
 ```python
-    mcp_client = None
-    tools = None
-    call_tool = None
-    if config.github_token:
-        from .mcp_client import McpToolClient
+    @app.on_event("startup")
+    async def _connect_mcp_client() -> None:
+        if config.github_token:
+            from .mcp_client import McpToolClient
 
-        mcp_client = McpToolClient(github_token=config.github_token)
-        await mcp_client.connect()
-        tools = mcp_client.tools
-        call_tool = mcp_client.call_tool
-        logger.info("GitHub MCP tools loaded (%d tool(s))", len(tools))
-
-    llm = LiteLlmClient(model=config.default_model, db_path=config.db_path, tools=tools, call_tool=call_tool)
+            mcp_client = McpToolClient(github_token=config.github_token)
+            await mcp_client.connect()
+            llm.set_tools(mcp_client.tools, mcp_client.call_tool)
+            logger.info("GitHub MCP tools loaded (%d tool(s))", len(mcp_client.tools))
+        else:
+            logger.info("GITHUB_TOKEN not set -- GitHub MCP tool-calling disabled")
 ```
 
-(`create_app()` needs to be `async def` for this `await mcp_client.connect()` to work -- check whether it already is; if not, this is the one place in this task that changes its call site too: wherever `create_app(config)` is invoked, e.g. `main.py`, must `await` it or run it via the existing asyncio entrypoint. Read `main.py` before making this change and adjust its call site to match.)
+`mcp_client` is deliberately a local variable inside this handler, not stored on `create_app()`'s scope beyond it -- nothing else needs to reach it after `set_tools()` has run (this plan does not implement graceful shutdown/`close()` for it, matching how `stt`/`tts`/`llm`/`navidrome` are also just constructed once and left for the process's lifetime with no explicit teardown elsewhere in this file).
 
 - [ ] **Step 2: Manual verification (no automated test for this task -- it only wires already-tested pieces together)**
 
