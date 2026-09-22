@@ -16,6 +16,14 @@ services:
       # pays the cold-load cost again. The Dockerfile has no USER
       # directive, so HOME inside the container is /root.
       - model_cache:/root/.cache/huggingface
+      # DB_PATH (db.py's SQLite file: transcripts, long-term memory, the
+      # admin-editable system prompt) needs the same treatment -- without
+      # this volume, a container recreate (docker-compose up --build after
+      # a code change) silently wipes all of it, same as the model cache
+      # would without model_cache above. Set DB_PATH=/app/data/haro.db in
+      # .env for this to actually land inside the volume.
+      - db_data:/app/data
 
 volumes:
   model_cache:
+  db_data:

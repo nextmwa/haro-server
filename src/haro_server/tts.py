@@ -1,54 +1,18 @@
 import asyncio
-import re
 from typing import AsyncIterator
 
-import librosa
-import numpy as np
-
-_SENTENCE_END_RE = re.compile(r"[.!?]\s")
+from .tts_common import (
+    as_numpy,
+    find_sentence_boundary,
+    resample_to_device_rate,
+    to_pcm16,
+)
 
 # Kokoro-82M's KPipeline always synthesizes at 24kHz (its fixed native
-# output rate -- not configurable). The ESP32 firmware's speaker output is
-# fixed at 16kHz: found on real hardware that its mic (RX) and speaker (TX)
-# share one full-duplex I2S controller, and esp_codec_dev's own driver
-# refuses to open them at two different sample rates ("conflict
-# sample_rate" -- see managed_components/espressif__esp_codec_dev's
-# audio_codec_data_i2s.c in the firmware repo), so the firmware side can't
-# just match Kokoro's rate instead. Playing 24kHz audio through a
-# 16kHz-configured DAC came out slowed down and garbled -- unintelligible,
-# not just lower quality. Resample here instead.
+# output rate -- not configurable). See tts_common.DEVICE_SAMPLE_RATE's
+# comment for why this needs resampling down rather than the firmware
+# matching Kokoro's rate instead.
 _KOKORO_SAMPLE_RATE = 24000
-_DEVICE_SAMPLE_RATE = 16000
-
-
-def _resample_to_device_rate(audio: np.ndarray) -> np.ndarray:
-    if _KOKORO_SAMPLE_RATE == _DEVICE_SAMPLE_RATE:
-        return audio
-    return librosa.resample(audio, orig_sr=_KOKORO_SAMPLE_RATE, target_sr=_DEVICE_SAMPLE_RATE)
-
-
-def _find_sentence_boundary(text: str) -> int | None:
-    match = _SENTENCE_END_RE.search(text)
-    if match is None:
-        return None
-    return match.end()
-
-
-def _to_pcm16(audio: np.ndarray) -> bytes:
-    clipped = np.clip(audio, -1.0, 1.0)
-    return (clipped * 32767).astype(np.int16).tobytes()
-
-
-def _as_numpy(audio) -> np.ndarray:
-    # The real KPipeline yields `KPipeline.Result.audio` as a
-    # torch.FloatTensor (see this module's KokoroTtsEngine docstring for
-    # the version this was verified against); FakePipeline in the tests
-    # yields plain numpy arrays. Normalize either to a numpy array here
-    # rather than in `_to_pcm16`, so that function's tested behavior
-    # (clip + scale + convert) stays exactly as specified against the fake.
-    if isinstance(audio, np.ndarray):
-        return audio
-    return audio.detach().cpu().numpy()
 
 
 class KokoroTtsEngine:
@@ -76,14 +40,14 @@ class KokoroTtsEngine:
         buffer = ""
         async for chunk in text_stream:
             buffer += chunk
-            boundary = _find_sentence_boundary(buffer)
+            boundary = find_sentence_boundary(buffer)
             while boundary is not None:
                 sentence, buffer = buffer[:boundary], buffer[boundary:]
                 for pcm_chunk in await asyncio.to_thread(
                     self._synthesize_sentence, sentence
                 ):
                     yield pcm_chunk
-                boundary = _find_sentence_boundary(buffer)
+                boundary = find_sentence_boundary(buffer)
         if buffer.strip():
             for pcm_chunk in await asyncio.to_thread(self._synthesize_sentence, buffer):
                 yield pcm_chunk
@@ -98,6 +62,6 @@ class KokoroTtsEngine:
         # returns a synchronous generator that cannot be iterated
         # incrementally from the event loop without blocking it again.
         return [
-            _to_pcm16(_resample_to_device_rate(_as_numpy(audio)))
+            to_pcm16(resample_to_device_rate(as_numpy(audio), _KOKORO_SAMPLE_RATE))
             for _, _, audio in self._pipeline(sentence, voice=self._voice)
         ]

@@ -1,0 +1,149 @@
+import datetime
+import sqlite3
+from dataclasses import dataclass
+
+# SQLite, not a client/server database: this runs as a single self-hosted
+# instance on one machine (see docker-compose.yml's model_cache volume --
+# same "one process, one box" deployment shape), so a file-based DB needs
+# no extra infrastructure and is trivial to back up (it's just a file).
+#
+# sqlite3's default connection is not safe to share across threads/asyncio
+# tasks that might run concurrently, so every function here opens (and
+# closes) its own short-lived connection rather than holding one open for
+# the server's lifetime -- these are small, infrequent reads/writes (a
+# couple of times per voice turn, plus occasional admin-page hits), not a
+# hot path where connection setup cost matters.
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS transcripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    transcript TEXT NOT NULL,
+    reply TEXT,
+    emotion TEXT
+);
+
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    fact TEXT NOT NULL,
+    source_session_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+@dataclass(frozen=True)
+class Transcript:
+    id: int
+    session_id: str
+    created_at: str
+    transcript: str
+    reply: str | None
+    emotion: str | None
+
+
+@dataclass(frozen=True)
+class Memory:
+    id: int
+    created_at: str
+    fact: str
+    source_session_id: str | None
+
+
+def init_db(db_path: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.UTC).isoformat()
+
+
+def save_transcript(
+    db_path: str, session_id: str, transcript: str, reply: str | None, emotion: str | None
+) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO transcripts (session_id, created_at, transcript, reply, emotion) VALUES (?, ?, ?, ?, ?)",
+            (session_id, _now(), transcript, reply, emotion),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_transcripts(db_path: str, limit: int = 50, offset: int = 0) -> list[Transcript]:
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, session_id, created_at, transcript, reply, emotion "
+            "FROM transcripts ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        return [Transcript(*row) for row in rows]
+    finally:
+        conn.close()
+
+
+def add_memory(db_path: str, fact: str, source_session_id: str | None) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO memories (created_at, fact, source_session_id) VALUES (?, ?, ?)",
+            (_now(), fact, source_session_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_memories(db_path: str) -> list[Memory]:
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, created_at, fact, source_session_id FROM memories ORDER BY id DESC"
+        ).fetchall()
+        return [Memory(*row) for row in rows]
+    finally:
+        conn.close()
+
+
+def delete_memory(db_path: str, memory_id: int) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_config_value(db_path: str, key: str) -> str | None:
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def set_config_value(db_path: str, key: str, value: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()

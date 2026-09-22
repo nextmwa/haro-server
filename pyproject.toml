@@ -7,7 +7,29 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "websockets>=12.0",
+    # FastAPI's Form(...) parsing (admin.py's system-prompt save form)
+    # requires this at runtime -- FastAPI only raises if it's missing when
+    # a form route is actually hit, not at import time, so it's easy to
+    # miss; declared explicitly rather than relying on some other
+    # dependency pulling it in transitively.
+    "python-multipart>=0.0.9",
     "litellm>=1.50.0",
+    # navidrome.py's Subsonic-API client (search + fetching a track's audio
+    # stream) needs an async HTTP client -- httpx, not requests, since the
+    # whole server is asyncio-based throughout.
+    "httpx>=0.27.0",
+    # face_tracking.py's server-side face detection (moved here from the
+    # ESP32 firmware: the on-device esp-dl models either missed faces
+    # unreliably (2-stage MSRMNP) or crashed the board with ESP_ERR_NO_MEM
+    # alongside the rest of its workload (single-stage ESPDet) -- the
+    # server has no such memory ceiling). "headless" build: no GUI/Qt
+    # dependencies, this never opens a window. Pinned below 5.0: verified
+    # that release removed cv2.CascadeClassifier entirely (replaced with
+    # FaceDetectorYN, a DNN detector that needs a separate .onnx model file
+    # this project doesn't bundle) -- 4.x still ships Haar cascade
+    # classifiers inside the wheel itself (cv2.data.haarcascades), which
+    # face_tracking.py relies on needing no separate model download.
+    "opencv-python-headless>=4.9.0,<5.0.0",
     # Pinned to 0.9.4, the version this adapter (tts.py) was verified
     # against. Note: `kokoro` (and `misaki`, its G2P dependency) declare
     # `requires-python < 3.13` from 0.8+ onward, so installing on Python
@@ -15,13 +37,25 @@ dependencies = [
     # hence the `requires-python` upper bound above, which turns that into
     # an explicit, readable resolution error instead.
     "kokoro==0.9.4",
+    # Third alternative TTS engine (pockettts_tts.py's PocketTtsEngine),
+    # selected via TTS_ENGINE=pockettts -- tried because Chatterbox
+    # Multilingual (see the `chatterbox` extra below), while accurate in
+    # Italian, measured ~16s on CPU to synthesize one short sentence.
+    # Kyutai's Pocket TTS (kyutai-labs/pocket-tts) is built CPU-first
+    # (~6x real-time on 2 CPU cores per its own docs) and ships a
+    # built-in Italian voice/language config. Kept as a separate,
+    # swappable engine, same idea as the chatterbox extra -- see
+    # tts_common.py's module docstring. Verified it resolves cleanly
+    # alongside nemo_toolkit[asr] below (unlike chatterbox-tts).
+    "pocket-tts>=3.1.0",
     "numpy>=1.24.0",
-    # Resamples Kokoro's fixed 24kHz TTS output down to the ESP32 firmware's
-    # fixed 16kHz speaker rate (tts.py's _resample_to_device_rate -- see its
-    # comment for why the mismatch exists and why it can't be fixed on the
-    # firmware side instead). Already pulled in transitively by
-    # nemo_toolkit[asr] below, but declared directly since tts.py imports it
-    # by name and that shouldn't depend on nemo's dependency tree shape.
+    # Resamples a TTS engine's native sample rate down to the ESP32
+    # firmware's fixed 16kHz speaker rate (tts_common.py's
+    # resample_to_device_rate() -- see its comment for why the mismatch
+    # exists and why it can't be fixed on the firmware side instead).
+    # Already pulled in transitively by nemo_toolkit[asr] below, but
+    # declared directly since tts_common.py imports it by name and that
+    # shouldn't depend on nemo's dependency tree shape.
     "librosa>=0.10.0",
     # nemo_toolkit[asr] provides the Parakeet STT model (stt.py). Verified
     # (see task-7-report.md) that `nemo_toolkit>=2.0.0` and its `asr` extra
@@ -36,6 +70,20 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+]
+# Chatterbox Multilingual (chatterbox_tts.py's ChatterboxTtsEngine),
+# selected via TTS_ENGINE=chatterbox -- kept as an *extra*, not a default
+# dependency, because chatterbox-tts 0.1.7 (its only PyPI release as of
+# this writing) hard-pins transformers==5.2.0, while every nemo_toolkit
+# [asr] release (used for Parakeet STT, in the main dependency list
+# above) caps transformers at ~4.57 -- verified via a real `pip install`
+# ResolutionImpossible error naming exactly this pair. The two cannot
+# coexist in one environment, so this extra is for a separate,
+# STT-less install used only to test/run Chatterbox on its own; the
+# default `pip install -e .` (main dependencies, no extras) is what the
+# Dockerfile uses and does NOT include it.
+chatterbox = [
+    "chatterbox-tts>=0.1.7",
 ]
 
 [tool.pytest.ini_options]

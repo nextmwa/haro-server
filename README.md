@@ -51,6 +51,25 @@ backtrack to an ancient `kokoro`.
 You'll also need the `espeak-ng` and `ffmpeg` system packages installed
 (see `Dockerfile` for why).
 
+## Optional features
+
+**Admin UI** (`/admin`, system prompt editor + transcript log + long-term
+memory browser): set `ADMIN_PASSWORD` in `.env`. Left unset, `/admin` is not
+served at all.
+
+**Long-term memory**: after each normal reply, a background LLM call looks
+for facts worth remembering (preferences, personal info) and stores them in
+the SQLite database (`DB_PATH`); they're injected into the system prompt on
+future turns. No setup needed beyond `DB_PATH` -- see `llm.py`.
+
+**Music playback from Navidrome**: say something like "metti musica di
+Vasco Rossi" and Haro searches your [Navidrome](https://www.navidrome.org/)
+library and plays the best match. Set `NAVIDROME_URL`, `NAVIDROME_USERNAME`,
+`NAVIDROME_PASSWORD` in `.env` (all three required). Saying the wake word
+again while a track plays interrupts it. Requires `ffmpeg` (already in the
+Docker image; see `Dockerfile`/README's local-dev note below if running
+without Docker).
+
 ## Manual testing without a robot
 
 `tools/fake_robot_client.py` speaks the robot's side of the protocol (sends

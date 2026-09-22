@@ -1,13 +1,6 @@
 import numpy as np
 
-from haro_server.tts import (
-    KokoroTtsEngine,
-    _DEVICE_SAMPLE_RATE,
-    _KOKORO_SAMPLE_RATE,
-    _find_sentence_boundary,
-    _resample_to_device_rate,
-    _to_pcm16,
-)
+from haro_server.tts import KokoroTtsEngine
 
 
 class FakePipeline:
@@ -24,34 +17,6 @@ class FakePipeline:
 async def _text_stream(chunks: list[str]):
     for chunk in chunks:
         yield chunk
-
-
-def test_find_sentence_boundary_finds_end_of_first_sentence():
-    assert _find_sentence_boundary("Ciao! Come stai?") == len("Ciao! ")
-
-
-def test_find_sentence_boundary_returns_none_without_terminator():
-    assert _find_sentence_boundary("nessun punto qui") is None
-
-
-def test_to_pcm16_converts_float_audio_to_16_bit_bytes():
-    audio = np.array([0.0, 0.5, -0.5, 1.5, -1.5], dtype=np.float32)
-    pcm = _to_pcm16(audio)
-    samples = np.frombuffer(pcm, dtype=np.int16)
-    assert samples[0] == 0
-    assert samples[1] == int(0.5 * 32767)
-    # Out-of-range values are clipped, not wrapped.
-    assert samples[3] == 32767
-    assert samples[4] == -32767
-
-
-def test_resample_to_device_rate_shortens_audio_to_the_device_rate():
-    # 1 second of audio at Kokoro's native rate must come out as ~1 second
-    # at the device's rate (a couple of samples of slack for the resampling
-    # filter's edge behavior, not an exact count).
-    one_second = np.zeros(_KOKORO_SAMPLE_RATE, dtype=np.float32)
-    resampled = _resample_to_device_rate(one_second)
-    assert abs(resampled.shape[0] - _DEVICE_SAMPLE_RATE) < 10
 
 
 async def test_synthesize_flushes_on_sentence_boundaries():

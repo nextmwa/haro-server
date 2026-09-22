@@ -1,6 +1,10 @@
+import asyncio
+
 import pytest
 
+from haro_server import db
 from haro_server.session import Session
+from haro_server.session import _background_tasks as background_tasks
 
 
 class FakeStt:
@@ -16,10 +20,22 @@ class FakeStt:
 
 
 class FakeLlm:
-    def __init__(self, chunks: list[str]) -> None:
+    def __init__(
+        self,
+        chunks: list[str],
+        facts: list[str] | None = None,
+        music_query: str = "",
+        picked_track_index: int | None = 0,
+    ) -> None:
         self._chunks = chunks
+        self._facts = facts if facts is not None else []
+        self._music_query = music_query
+        self._picked_track_index = picked_track_index
         self.received_transcript: str | None = None
         self.stream_reply_calls = 0
+        self.extract_facts_calls: list[tuple[str, str]] = []
+        self.extract_music_query_calls: list[str] = []
+        self.pick_best_track_calls: list[tuple[str, list]] = []
 
     def stream_reply(self, transcript: str):
         self.stream_reply_calls += 1
@@ -29,6 +45,20 @@ class FakeLlm:
     async def _chunk_generator(self):
         for chunk in self._chunks:
             yield chunk
+
+    async def extract_facts(self, transcript: str, reply: str) -> list[str]:
+        self.extract_facts_calls.append((transcript, reply))
+        return self._facts
+
+    async def extract_music_query(self, transcript: str) -> str:
+        self.extract_music_query_calls.append(transcript)
+        return self._music_query
+
+    async def pick_best_track(self, transcript: str, candidates: list):
+        self.pick_best_track_calls.append((transcript, candidates))
+        if self._picked_track_index is None or not candidates:
+            return None
+        return candidates[self._picked_track_index]
 
 
 class FakeTts:
@@ -47,6 +77,47 @@ class FakeTts:
         async for text in text_stream:
             self.received_text.append(text)
             yield f"audio:{text}".encode()
+
+
+class FakeTrack:
+    def __init__(self, id: str, title: str, artist: str, album: str = "") -> None:
+        self.id = id
+        self.title = title
+        self.artist = artist
+        self.album = album
+
+
+class FakeNavidrome:
+    def __init__(self, search_results: list[FakeTrack] | None = None, pcm_chunks: list[bytes] | None = None) -> None:
+        self._search_results = search_results if search_results is not None else []
+        self._pcm_chunks = pcm_chunks if pcm_chunks is not None else [b"pcm1", b"pcm2"]
+        self.search_calls: list[str] = []
+        self.stream_calls: list[str] = []
+        # Set when stream_track_as_pcm16's generator is cancelled mid-
+        # iteration -- lets a test prove handle_interrupt() actually tore
+        # down the stream rather than just cancelling the outer task.
+        self.stream_cancelled = False
+
+    async def search(self, query: str, count: int = 10) -> list[FakeTrack]:
+        self.search_calls.append(query)
+        return self._search_results
+
+    async def stream_track_as_pcm16(self, track_id: str):
+        self.stream_calls.append(track_id)
+        try:
+            for chunk in self._pcm_chunks:
+                yield chunk
+        except GeneratorExit:
+            # session.py's finally block calls stream.aclose() on every
+            # exit path (see its comment) -- aclose() throws GeneratorExit
+            # into the generator at its suspended `yield`, NOT
+            # CancelledError (that's what the *task* running _play_music()
+            # received; this generator is a separate object). Mirrors
+            # navidrome.py's real generator, which cleans up its ffmpeg
+            # subprocess via a plain `finally` regardless of exception type
+            # for the same reason.
+            self.stream_cancelled = True
+            raise
 
 
 def _make_session(llm_chunks, sent_text=None, sent_binary=None):
@@ -159,6 +230,34 @@ async def test_end_of_speech_with_empty_transcript_skips_llm_and_tts():
     assert tts.received_text == []
     # Only response_end: no emotion message, no audio.
     assert events == [("text", '{"type": "response_end"}')]
+
+
+async def test_end_of_speech_with_action_transcript_skips_llm_and_tts():
+    import json
+
+    events: list[tuple[str, object]] = []
+
+    async def send_text(text: str) -> None:
+        events.append(("text", text))
+
+    async def send_binary(data: bytes) -> None:
+        events.append(("binary", data))
+
+    stt = FakeStt(transcript="lancia un dado")
+    llm = FakeLlm(chunks=["[emotion:happy] non dovrebbe accadere"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary)
+
+    await session.handle_end_of_speech()
+
+    assert llm.stream_reply_calls == 0
+    assert tts.synthesize_calls == 0
+    assert len(events) == 2
+    action_event = json.loads(events[0][1])
+    assert action_event["type"] == "action"
+    assert action_event["name"] == "dice_roll"
+    assert action_event["result"] in range(1, 7)
+    assert events[1] == ("text", '{"type": "response_end"}')
 
 
 class _TrackingAsyncGen:
@@ -313,3 +412,215 @@ async def test_end_of_speech_closes_tts_stream_when_turn_is_aborted():
 
     assert tts.stream is not None
     assert tts.stream.aclose_calls == 1
+
+
+async def _drain_background_tasks() -> None:
+    """Awaits every fact-extraction task Session._spawn_fact_extraction has
+    scheduled so far, so a test can assert on its effects (a fire-and-
+    forget asyncio.create_task() would otherwise still be pending, or not
+    even started, when the test function itself returns).
+    """
+    for task in list(background_tasks):
+        await task
+
+
+async def test_end_of_speech_saves_the_transcript_when_db_path_is_set(tmp_path):
+    db_path = str(tmp_path / "haro.db")
+    db.init_db(db_path)
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        pass
+
+    stt = FakeStt(transcript="che tempo fa oggi")
+    llm = FakeLlm(chunks=["[emotion:neutral] Fa bello oggi."])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary, db_path=db_path)
+    await session.handle_hello("session-xyz")
+
+    await session.handle_end_of_speech()
+    await _drain_background_tasks()
+
+    transcripts = db.get_transcripts(db_path)
+    assert len(transcripts) == 1
+    assert transcripts[0].session_id == "session-xyz"
+    assert transcripts[0].transcript == "che tempo fa oggi"
+    assert transcripts[0].reply == "Fa bello oggi."
+    assert transcripts[0].emotion == "neutral"
+
+
+async def test_end_of_speech_saves_action_turns_to_the_transcript_log(tmp_path):
+    db_path = str(tmp_path / "haro.db")
+    db.init_db(db_path)
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        pass
+
+    stt = FakeStt(transcript="lancia un dado")
+    llm = FakeLlm(chunks=["non dovrebbe essere chiamato"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary, db_path=db_path)
+
+    await session.handle_end_of_speech()
+
+    transcripts = db.get_transcripts(db_path)
+    assert len(transcripts) == 1
+    assert transcripts[0].transcript == "lancia un dado"
+    assert transcripts[0].reply is not None
+    assert transcripts[0].reply.startswith("[azione: dice_roll")
+
+
+async def test_end_of_speech_stores_extracted_facts_as_memories(tmp_path):
+    db_path = str(tmp_path / "haro.db")
+    db.init_db(db_path)
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        pass
+
+    stt = FakeStt(transcript="il mio compleanno e' il 5 maggio")
+    llm = FakeLlm(
+        chunks=["[emotion:happy] Bello saperlo!"],
+        facts=["il compleanno dell'utente e' il 5 maggio"],
+    )
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary, db_path=db_path)
+    await session.handle_hello("session-abc")
+
+    await session.handle_end_of_speech()
+    await _drain_background_tasks()
+
+    assert llm.extract_facts_calls == [("il mio compleanno e' il 5 maggio", "Bello saperlo!")]
+    memories = db.get_memories(db_path)
+    assert len(memories) == 1
+    assert memories[0].fact == "il compleanno dell'utente e' il 5 maggio"
+    assert memories[0].source_session_id == "session-abc"
+
+
+async def test_end_of_speech_does_not_touch_the_db_when_db_path_is_none():
+    # Every other test in this file constructs Session without db_path
+    # (defaults to None) and must keep working with zero DB side effects --
+    # this test only makes that "no persistence configured" contract
+    # explicit rather than relying on it being implied by every other test
+    # simply not checking for a db file.
+    session, *_ = _make_session(llm_chunks=["[emotion:happy] ok"])
+    assert session._db_path is None
+
+    await session.handle_end_of_speech()
+    await _drain_background_tasks()  # must be a no-op: nothing was spawned
+
+
+async def test_music_request_without_navidrome_configured_sends_an_error():
+    events: list[tuple[str, object]] = []
+
+    async def send_text(text: str) -> None:
+        events.append(("text", text))
+
+    async def send_binary(data: bytes) -> None:
+        events.append(("binary", data))
+
+    stt = FakeStt(transcript="metti della musica di Vasco Rossi")
+    llm = FakeLlm(chunks=["non dovrebbe essere chiamato"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary)  # navidrome=None (default)
+
+    await session.handle_end_of_speech()
+    await asyncio.sleep(0)  # let the spawned task run
+
+    assert any(e[0] == "text" and '"type": "error"' in e[1] for e in events)
+    assert any(e[1] == '{"type": "response_end"}' for e in events)
+    assert events[-1] == ("text", '{"type": "response_end"}')
+
+
+async def test_music_request_plays_the_picked_track():
+    events: list[tuple[str, object]] = []
+
+    async def send_text(text: str) -> None:
+        events.append(("text", text))
+
+    async def send_binary(data: bytes) -> None:
+        events.append(("binary", data))
+
+    stt = FakeStt(transcript="metti Vita Spericolata di Vasco Rossi")
+    track = FakeTrack(id="song-1", title="Vita Spericolata", artist="Vasco Rossi")
+    llm = FakeLlm(chunks=[], music_query="Vita Spericolata Vasco Rossi", picked_track_index=0)
+    navidrome = FakeNavidrome(search_results=[track], pcm_chunks=[b"pcm1", b"pcm2"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary, navidrome=navidrome)
+
+    await session.handle_end_of_speech()
+    await session._music_task
+
+    assert llm.extract_music_query_calls == ["metti Vita Spericolata di Vasco Rossi"]
+    assert navidrome.search_calls == ["Vita Spericolata Vasco Rossi"]
+    assert navidrome.stream_calls == ["song-1"]
+    assert events[0] == ("text", '{"type": "action", "name": "music_playing", "result": "Vita Spericolata - Vasco Rossi"}')
+    assert events[1] == ("binary", b"pcm1")
+    assert events[2] == ("binary", b"pcm2")
+    assert events[-1] == ("text", '{"type": "response_end"}')
+
+
+async def test_music_request_with_no_search_results_sends_an_error():
+    events: list[tuple[str, object]] = []
+
+    async def send_text(text: str) -> None:
+        events.append(("text", text))
+
+    async def send_binary(data: bytes) -> None:
+        events.append(("binary", data))
+
+    stt = FakeStt(transcript="metti qualcosa che non esiste")
+    llm = FakeLlm(chunks=[], music_query="qualcosa che non esiste")
+    navidrome = FakeNavidrome(search_results=[])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary, navidrome=navidrome)
+
+    await session.handle_end_of_speech()
+    await session._music_task
+
+    assert navidrome.stream_calls == []
+    assert any(e[0] == "text" and '"type": "error"' in e[1] for e in events)
+    assert events[-1] == ("text", '{"type": "response_end"}')
+
+
+async def test_handle_interrupt_cancels_an_in_flight_music_task():
+    events: list[tuple[str, object]] = []
+
+    async def send_text(text: str) -> None:
+        events.append(("text", text))
+
+    async def send_binary(data: bytes) -> None:
+        events.append(("binary", data))
+        await asyncio.sleep(0.05)  # simulate real send pacing so there's time to interrupt
+
+    stt = FakeStt(transcript="metti musica")
+    track = FakeTrack(id="song-1", title="Some Song", artist="Some Artist")
+    llm = FakeLlm(chunks=[], music_query="musica", picked_track_index=0)
+    navidrome = FakeNavidrome(search_results=[track], pcm_chunks=[b"pcm1", b"pcm2", b"pcm3", b"pcm4"])
+    tts = FakeTts()
+    session = Session(stt, llm, tts, send_text, send_binary, navidrome=navidrome)
+
+    await session.handle_end_of_speech()
+    await asyncio.sleep(0.01)  # let the first chunk or two send
+    await session.handle_interrupt()
+
+    with pytest.raises(asyncio.CancelledError):
+        await session._music_task
+
+    assert navidrome.stream_cancelled is True
+    # Interrupted mid-track: response_end must NOT have been sent (the
+    # robot is about to start a new LISTENING turn, not finish this one).
+    assert not any(e == ("text", '{"type": "response_end"}') for e in events)
+
+
+async def test_handle_interrupt_with_no_active_music_task_is_a_no_op():
+    session, *_ = _make_session(llm_chunks=[])
+
+    await session.handle_interrupt()  # must not raise

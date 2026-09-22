@@ -10,8 +10,27 @@ class Config:
     default_model: str = "claude-sonnet-5"
     stt_device: str = "cpu"
     tts_device: str = "cpu"
+    # "kokoro", "chatterbox", or "pockettts" -- see server.py's
+    # construction site and tts_common.py's module docstring for why
+    # swapping this is a one-line config change, not a code change.
+    # Defaults to "kokoro" (the original, lighter engine) so nothing
+    # changes for a deployment that doesn't set this explicitly.
+    tts_engine: str = "kokoro"
     host: str = "0.0.0.0"
     port: int = 8765
+    db_path: str = "haro.db"
+    # Protects the /admin web UI (system prompt editor, transcript log,
+    # long-term memory browser) with HTTP Basic Auth -- see admin.py. None
+    # means "no admin UI credentials configured"; server.py refuses to
+    # mount /admin in that case rather than serving it unprotected.
+    admin_password: str | None = None
+    # Navidrome music playback (navidrome.py, session.py's _play_music()).
+    # All three must be set for it to activate -- server.py treats any
+    # missing piece as "not configured" and music requests get a plain
+    # error reply instead.
+    navidrome_url: str | None = None
+    navidrome_username: str | None = None
+    navidrome_password: str | None = None
 
     @staticmethod
     def from_env() -> "Config":
@@ -22,6 +41,12 @@ class Config:
             default_model=os.environ.get("DEFAULT_MODEL", "claude-sonnet-5"),
             stt_device=os.environ.get("STT_DEVICE", "cpu"),
             tts_device=os.environ.get("TTS_DEVICE", "cpu"),
+            tts_engine=os.environ.get("TTS_ENGINE", "kokoro"),
             host=os.environ.get("HOST", "0.0.0.0"),
             port=int(os.environ.get("PORT", "8765")),
+            db_path=os.environ.get("DB_PATH", "haro.db"),
+            admin_password=os.environ.get("ADMIN_PASSWORD") or None,
+            navidrome_url=os.environ.get("NAVIDROME_URL") or None,
+            navidrome_username=os.environ.get("NAVIDROME_USERNAME") or None,
+            navidrome_password=os.environ.get("NAVIDROME_PASSWORD") or None,
         )

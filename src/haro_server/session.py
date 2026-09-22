@@ -1,10 +1,19 @@
+import asyncio
 import logging
 import re
-from typing import AsyncIterator, Awaitable, Callable, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 
-from . import protocol
+from . import actions, db, music, protocol
 
 logger = logging.getLogger(__name__)
+
+# Fire-and-forget background fact-extraction tasks (see Session._spawn_fact_extraction)
+# need a strong reference kept somewhere until they finish, or asyncio may
+# garbage-collect a task mid-flight with no warning (a well-known asyncio
+# footgun -- see the "Save a reference to the result" note in
+# asyncio.create_task's own docs). Module-level since these tasks outlive
+# any single Session/turn.
+_background_tasks: set[asyncio.Task] = set()
 
 
 class SttEngineLike(Protocol):
@@ -14,10 +23,18 @@ class SttEngineLike(Protocol):
 
 class LlmClientLike(Protocol):
     def stream_reply(self, transcript: str) -> AsyncIterator[str]: ...
+    async def extract_facts(self, transcript: str, reply: str) -> list[str]: ...
+    async def extract_music_query(self, transcript: str) -> str: ...
+    async def pick_best_track(self, transcript: str, candidates: list[Any]) -> Any | None: ...
 
 
 class TtsEngineLike(Protocol):
     def synthesize(self, text_stream: AsyncIterator[str]) -> AsyncIterator[bytes]: ...
+
+
+class NavidromeLike(Protocol):
+    async def search(self, query: str, count: int = 10) -> list[Any]: ...
+    def stream_track_as_pcm16(self, track_id: str) -> AsyncIterator[bytes]: ...
 
 
 SendText = Callable[[str], Awaitable[None]]
@@ -35,12 +52,23 @@ class Session:
         tts: TtsEngineLike,
         send_text: SendText,
         send_binary: SendBinary,
+        db_path: str | None = None,
+        navidrome: NavidromeLike | None = None,
     ) -> None:
         self._stt = stt
         self._llm = llm
         self._tts = tts
         self._send_text = send_text
         self._send_binary = send_binary
+        # None means "no persistence configured" (also what every existing
+        # test that doesn't care about it passes implicitly) -- every save/
+        # extract call below is a no-op in that case.
+        self._db_path = db_path
+        # None means "Navidrome not configured" -- a music request then
+        # gets a plain error reply instead of attempting playback. See
+        # _play_music()/handle_interrupt().
+        self._navidrome = navidrome
+        self._music_task: asyncio.Task | None = None
         self.session_id: str | None = None
 
     async def handle_hello(self, session_id: str) -> None:
@@ -63,27 +91,150 @@ class Session:
             await self._send_text(protocol.encode_response_end())
             return
 
+        action = actions.match_action(transcript)
+        if action is not None:
+            # Deterministic utility command (dice, coin flip, ...) -- see
+            # actions.py's module docstring for why this bypasses the LLM
+            # entirely rather than asking it to "roll a die" itself.
+            result = action.resolve()
+            logger.info("action matched: %s -> %r", action.name, result)
+            await self._send_text(protocol.encode_action(action.name, result))
+            await self._send_text(protocol.encode_response_end())
+            self._save_transcript(transcript, reply=f"[azione: {action.name} -> {result}]", emotion=None)
+            return
+
+        if music.is_music_request(transcript):
+            # Spawned as a background task, NOT awaited inline: a track can
+            # play for minutes, and the outer server.py receive loop must
+            # stay free to catch an `interrupt` message (wake word firing
+            # mid-song) the whole time -- see handle_interrupt() and this
+            # method's own docstring-length comment on _play_music() for
+            # why this is the one turn type that can't just be a straight
+            # await like every other branch in this method.
+            if self._music_task is not None and not self._music_task.done():
+                self._music_task.cancel()
+            self._music_task = asyncio.create_task(self._play_music(transcript))
+            return
+
         raw_reply = self._llm.stream_reply(transcript)
         emotion, text_stream = await _split_emotion_prefix(raw_reply)
         await self._send_text(protocol.encode_emotion(emotion))
 
-        tts_stream = self._tts.synthesize(text_stream)
+        # Tees the reply text past TTS into `reply_parts` too, so the full
+        # reply is available afterward for the transcript log and fact
+        # extraction below without a second LLM pass.
+        reply_parts: list[str] = []
+        teed_stream = _tee(text_stream, reply_parts)
+
+        tts_stream = self._tts.synthesize(teed_stream)
         try:
             async for chunk in tts_stream:
                 await self._send_binary(chunk)
         finally:
-            # tts_stream, text_stream (the _prepend wrapper), and raw_reply
-            # each only delegate to the next via `async for`, which does NOT
-            # cascade .aclose() through the chain -- so all three must be
-            # closed explicitly, or an aborted turn (e.g. the robot
-            # disconnects mid-reply) leaves generators/connections suspended
-            # until garbage collection eventually gets to them, instead of
-            # closing promptly.
+            # tts_stream, teed_stream, text_stream (the _prepend wrapper),
+            # and raw_reply each only delegate to the next via `async for`,
+            # which does NOT cascade .aclose() through the chain -- so all
+            # four must be closed explicitly, or an aborted turn (e.g. the
+            # robot disconnects mid-reply) leaves generators/connections
+            # suspended until garbage collection eventually gets to them,
+            # instead of closing promptly.
             await tts_stream.aclose()
+            await teed_stream.aclose()
             await text_stream.aclose()
             await raw_reply.aclose()
 
         await self._send_text(protocol.encode_response_end())
+
+        full_reply = "".join(reply_parts)
+        self._save_transcript(transcript, full_reply, emotion)
+        self._spawn_fact_extraction(transcript, full_reply)
+
+    def _save_transcript(self, transcript: str, reply: str | None, emotion: str | None) -> None:
+        if self._db_path is None:
+            return
+        db.save_transcript(self._db_path, self.session_id or "unknown", transcript, reply, emotion)
+
+    def _spawn_fact_extraction(self, transcript: str, reply: str) -> None:
+        if self._db_path is None:
+            return
+        db_path = self._db_path
+        session_id = self.session_id
+
+        async def _run() -> None:
+            facts = await self._llm.extract_facts(transcript, reply)
+            for fact in facts:
+                db.add_memory(db_path, fact, session_id)
+            if facts:
+                logger.info("stored %d new memory fact(s)", len(facts))
+
+        task = asyncio.create_task(_run())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    async def handle_interrupt(self) -> None:
+        """The wake word fired while a background music task is streaming
+        (see handle_end_of_speech()'s music branch) -- cancel it. Cancelling
+        the task raises CancelledError inside whatever it's awaiting (most
+        likely navidrome.py's stream_track_as_pcm16(), mid `async for`),
+        which its own try/finally there uses to tear down the ffmpeg
+        subprocess promptly rather than leaving it running unattended.
+        A no-op if nothing is currently playing (e.g. the interrupt lost a
+        race with the track finishing naturally).
+        """
+        if self._music_task is not None and not self._music_task.done():
+            self._music_task.cancel()
+
+    async def _play_music(self, transcript: str) -> None:
+        if self._navidrome is None:
+            logger.info("music request received but Navidrome is not configured")
+            await self._send_text(protocol.encode_error("la riproduzione musicale non e' configurata"))
+            await self._send_text(protocol.encode_response_end())
+            return
+
+        # Captured here (not iterated inline) so the finally block below
+        # can explicitly .aclose() it on every exit path -- an `async for`
+        # exiting via a propagating exception does NOT implicitly close the
+        # iterator, the same reason handle_end_of_speech()'s normal-reply
+        # path above explicitly closes tts_stream/teed_stream/text_stream/
+        # raw_reply instead of relying on GC. Without this, an interrupt
+        # cancelling this task never reached navidrome.py's own cleanup
+        # (confirmed missing by test_handle_interrupt_cancels_an_in_flight_music_task
+        # before this fix -- the ffmpeg subprocess would leak until GC).
+        stream: AsyncIterator[bytes] | None = None
+        try:
+            query = await self._llm.extract_music_query(transcript)
+            candidates = await self._navidrome.search(query)
+            track = await self._llm.pick_best_track(transcript, candidates) if candidates else None
+
+            if track is None:
+                logger.info("no matching track found for query: %r", query)
+                await self._send_text(protocol.encode_error("non ho trovato nessun brano corrispondente"))
+                await self._send_text(protocol.encode_response_end())
+                return
+
+            logger.info("playing track: %s - %s", track.title, track.artist)
+            await self._send_text(protocol.encode_action("music_playing", f"{track.title} - {track.artist}"))
+            self._save_transcript(transcript, reply=f"[musica: {track.title} - {track.artist}]", emotion=None)
+
+            stream = self._navidrome.stream_track_as_pcm16(track.id)
+            async for chunk in stream:
+                await self._send_binary(chunk)
+
+            await self._send_text(protocol.encode_response_end())
+        except asyncio.CancelledError:
+            logger.info("music playback interrupted")
+            raise
+        except Exception:
+            logger.exception("music playback failed")
+            try:
+                await self._send_text(protocol.encode_error("errore durante la riproduzione musicale"))
+                await self._send_text(protocol.encode_response_end())
+            except Exception:
+                pass  # connection is likely already gone
+        finally:
+            if stream is not None:
+                await stream.aclose()
+            self._music_task = None
 
 
 async def _split_emotion_prefix(
@@ -109,4 +260,10 @@ async def _prepend(text: str, rest: AsyncIterator[str]) -> AsyncIterator[str]:
     if text:
         yield text
     async for chunk in rest:
+        yield chunk
+
+
+async def _tee(chunks: AsyncIterator[str], collected: list[str]) -> AsyncIterator[str]:
+    async for chunk in chunks:
+        collected.append(chunk)
         yield chunk
