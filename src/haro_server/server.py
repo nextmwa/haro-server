@@ -121,6 +121,18 @@ def create_app(config: Config) -> FastAPI:
         else:
             logger.info("no GitHub token or Calendar credentials configured -- proactive events disabled")
 
+    @app.on_event("startup")
+    async def _connect_mcp_client() -> None:
+        if config.github_token:
+            from .mcp_client import McpToolClient
+
+            mcp_client = McpToolClient(github_token=config.github_token)
+            await mcp_client.connect()
+            llm.set_tools(mcp_client.tools, mcp_client.call_tool)
+            logger.info("GitHub MCP tools loaded (%d tool(s))", len(mcp_client.tools))
+        else:
+            logger.info("GITHUB_TOKEN not set -- GitHub MCP tool-calling disabled")
+
     @app.websocket("/")
     async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
