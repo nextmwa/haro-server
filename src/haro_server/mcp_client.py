@@ -39,6 +39,19 @@ written: mcp==2.2.0, litellm==1.99.0. Real findings from
   manager, then call initialize()" -- `_open_stdio_session` does exactly
   that; skipping `initialize()` leaves the session unable to answer
   other requests.
+- Both `stdio_client` and `ClientSession.__aenter__` bind an anyio cancel
+  scope to whichever asyncio task enters them (confirmed via
+  `inspect.getsource`: `stdio_client`'s body runs inside
+  `async with anyio.create_task_group() as tg:`, and
+  `ClientSession.__aenter__` does
+  `self._task_group = anyio.create_task_group(); await
+  self._task_group.__aenter__()`). Consequently **`connect()` and
+  `close()` must be awaited from the same asyncio task** -- exiting from
+  a different task raises `RuntimeError: Attempted to exit cancel scope
+  in a different task than it was entered in`. This is a real
+  constraint on how a caller (e.g. Task 10's server-startup wiring) must
+  use this class, not just a style note -- see the docstring on
+  `McpToolClient.close()` below.
 - `litellm.experimental_mcp_client.load_mcp_tools(session, format)` and
   `.call_openai_tool(session, openai_tool)` match the brief's guessed
   names and signatures exactly. `load_mcp_tools(session, "openai")`
@@ -68,14 +81,29 @@ async def _open_stdio_session(command: str, args: list[str], env: dict[str, str]
     avoid spawning a real subprocess -- see tests/test_mcp_client.py.
     """
     params = StdioServerParameters(command=command, args=args, env=env)
-    exit_stack = AsyncExitStack()
-    read_stream, write_stream = await exit_stack.enter_async_context(stdio_client(params))
-    session = await exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
-    await session.initialize()
-    # Stash the stack that keeps the subprocess/pipes/session alive so
-    # McpToolClient.close() can unwind it later -- see module docstring.
-    session._haro_exit_stack = exit_stack
-    return session
+    # `async with AsyncExitStack() as exit_stack:` rather than a bare
+    # `AsyncExitStack()` -- if `enter_async_context` (either call) or
+    # `session.initialize()` below raises, this block's `__aexit__` runs
+    # and unwinds whatever was already entered (killing the subprocess,
+    # closing its pipes), instead of leaking them: AsyncExitStack does
+    # NOT auto-unwind on its own just because it becomes unreachable: it
+    # unwinds only when something calls `.aclose()` on it (or, here, its
+    # own `async with` exits) -- reproduced experimentally: a bare
+    # `AsyncExitStack()` with no `async with`/`aclose()` around a raising
+    # `enter_async_context` call left the spawned subprocess running.
+    async with AsyncExitStack() as exit_stack:
+        read_stream, write_stream = await exit_stack.enter_async_context(stdio_client(params))
+        session = await exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
+        await session.initialize()
+        # Success path: `pop_all()` moves ownership of the already-entered
+        # context managers to a fresh stack *without* closing them, so
+        # they stay open past this function's return (needed since this
+        # session must outlive `_open_stdio_session` itself, across
+        # separate connect()/call_tool()/close() calls) -- while the
+        # `async with` above still auto-unwinds everything on any
+        # exception raised before reaching this line.
+        session._haro_exit_stack = exit_stack.pop_all()
+        return session
 
 
 async def _load_mcp_tools(session: ClientSession, format: str) -> list[dict]:
@@ -113,6 +141,19 @@ class McpToolClient:
         return result.model_dump_json()
 
     async def close(self) -> None:
+        """Close the stdio session/subprocess opened by connect().
+
+        MUST be awaited from the same asyncio task that awaited connect().
+        Both `stdio_client` and `ClientSession` bind an anyio cancel scope
+        to whichever task enters them (see module docstring); unwinding
+        that scope from a different task raises `RuntimeError: Attempted
+        to exit cancel scope in a different task than it was entered in`.
+        This is a real constraint on any caller of this class (e.g. Task
+        10's server-startup wiring must call connect() and close() from
+        the same task/coroutine, not e.g. close() from a signal handler
+        or a separately-scheduled task), not just an implementation
+        detail of this method.
+        """
         if self._session is None:
             return
         exit_stack = getattr(self._session, "_haro_exit_stack", None)
