@@ -1,5 +1,6 @@
 # src/haro_server/server.py
 import asyncio
+import contextlib
 import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -42,20 +43,7 @@ def _build_tts_engine(config: Config):
 
 
 def create_app(config: Config) -> FastAPI:
-    app = FastAPI()
-
     db.init_db(config.db_path)
-
-    if config.admin_password:
-        app.include_router(create_admin_router(config.db_path, config.admin_password))
-        logger.info("admin UI mounted at /admin")
-    else:
-        # No unauthenticated fallback: an admin UI that edits the system
-        # prompt and shows every transcript is not something to expose
-        # without a password just because none was configured -- it stays
-        # off entirely (ADMIN_PASSWORD unset in .env is "no admin UI", not
-        # "open admin UI").
-        logger.warning("ADMIN_PASSWORD not set -- /admin UI disabled")
 
     # Loaded once, at server startup, and shared across every connection --
     # see this task's design note. A failure here fails server startup
@@ -87,51 +75,138 @@ def create_app(config: Config) -> FastAPI:
     async def run_scheduler() -> None:
         calendar_service = None
         if config.google_calendar_credentials_path:
-            from google.oauth2.credentials import Credentials
-            from googleapiclient.discovery import build
+            try:
+                from google.oauth2.credentials import Credentials
+                from googleapiclient.discovery import build
 
-            credentials = Credentials.from_authorized_user_file(config.google_calendar_credentials_path)
-            calendar_service = build("calendar", "v3", credentials=credentials)
+                credentials = Credentials.from_authorized_user_file(config.google_calendar_credentials_path)
+                calendar_service = build("calendar", "v3", credentials=credentials)
+            except Exception:
+                # A bad credentials path or malformed token file must
+                # degrade Calendar polling only -- it must not also take
+                # GitHub polling down with it (this used to run before
+                # the loop with no guard at all, so any failure here
+                # killed run_scheduler() entirely -- see C2 in the final
+                # review).
+                logger.exception(
+                    "failed to initialize the Google Calendar client -- Calendar polling disabled"
+                )
+                calendar_service = None
 
         import httpx
 
         async with httpx.AsyncClient(base_url="https://api.github.com") as client:
             while True:
-                if config.github_token and config.github_repos:
-                    for event in await poll_github(
-                        client, config.db_path, config.github_token, config.github_repos
-                    ):
-                        event_bus.publish(event)
-                if calendar_service is not None:
-                    for event in await poll_calendar(calendar_service, config.db_path):
-                        event_bus.publish(event)
+                try:
+                    if config.github_token and config.github_repos:
+                        for event in await poll_github(
+                            client, config.db_path, config.github_token, config.github_repos
+                        ):
+                            event_bus.publish(event)
+                    if calendar_service is not None:
+                        for event in await poll_calendar(calendar_service, config.db_path):
+                            event_bus.publish(event)
+                except Exception:
+                    # Never let one bad poll cycle kill this task
+                    # permanently and silently -- log it and try again
+                    # next interval (see C2 in the final review).
+                    logger.exception("proactive event poll cycle failed, will retry next interval")
                 await asyncio.sleep(config.event_poll_interval_seconds)
 
-    @app.on_event("startup")
-    async def _start_background_event_tasks() -> None:
-        # Registered here (not called directly in create_app()'s body)
-        # because create_app() runs before uvicorn's event loop exists --
-        # see this task's Context note. FastAPI runs every "startup"
-        # handler once that loop is actually up, which is the earliest
-        # point asyncio.create_task() is legal here.
+    def _log_if_task_exited_unexpectedly(name: str):
+        def _callback(task: asyncio.Task) -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error("%s background task exited unexpectedly", name, exc_info=exc)
+
+        return _callback
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup and shutdown for both the background poller/announcer
+        # tasks (Task 7) and the GitHub MCP client connection (Task 10)
+        # used to be two separate, order-coupled `@app.on_event("startup")`
+        # handlers with no shutdown counterpart at all -- deprecated in
+        # the installed FastAPI/Starlette, and structurally unable to
+        # either retain task references or close the MCP subprocess (see
+        # C1/C2/I8 in the final review). A single lifespan context
+        # manager fixes all three: startup runs before `yield`, shutdown
+        # after it, and both halves run in this same coroutine -- which
+        # matters because mcp_client.py's close() MUST be awaited from
+        # the same asyncio task that awaited connect() (see its own
+        # docstring).
+        background_tasks: list[asyncio.Task] = []
         if config.github_token or config.google_calendar_credentials_path:
-            asyncio.create_task(run_scheduler())
-            asyncio.create_task(run_announcer(event_bus, get_active_session))
+            scheduler_task = asyncio.create_task(run_scheduler())
+            announcer_task = asyncio.create_task(run_announcer(event_bus, get_active_session))
+            scheduler_task.add_done_callback(_log_if_task_exited_unexpectedly("run_scheduler"))
+            announcer_task.add_done_callback(_log_if_task_exited_unexpectedly("run_announcer"))
+            # Retained here for the lifetime of the app -- an
+            # asyncio.Task with no strong reference held anywhere can be
+            # garbage-collected mid-flight with no warning (the same
+            # footgun session.py's own _background_tasks set guards
+            # against for fact-extraction tasks).
+            background_tasks.extend([scheduler_task, announcer_task])
             logger.info("proactive event polling started (interval=%ds)", config.event_poll_interval_seconds)
         else:
             logger.info("no GitHub token or Calendar credentials configured -- proactive events disabled")
 
-    @app.on_event("startup")
-    async def _connect_mcp_client() -> None:
+        mcp_client = None
         if config.github_token:
             from .mcp_client import McpToolClient
 
             mcp_client = McpToolClient(github_token=config.github_token)
-            await mcp_client.connect()
-            llm.set_tools(mcp_client.tools, mcp_client.call_tool)
-            logger.info("GitHub MCP tools loaded (%d tool(s))", len(mcp_client.tools))
+            try:
+                await mcp_client.connect()
+            except Exception:
+                # An optional integration (github-mcp-server missing from
+                # PATH, an invalid/expired token, a handshake timeout)
+                # must never take the whole robot down over it -- STT,
+                # TTS, conversation, and music all work fine without
+                # GitHub tool-calling. Leave llm tool-less instead of
+                # propagating and crashing server startup (see C1 in the
+                # final review).
+                logger.exception(
+                    "failed to connect to the GitHub MCP server -- GitHub tool-calling disabled"
+                )
+                mcp_client = None
+            else:
+                llm.set_tools(mcp_client.tools, mcp_client.call_tool)
+                logger.info("GitHub MCP tools loaded (%d tool(s))", len(mcp_client.tools))
         else:
             logger.info("GITHUB_TOKEN not set -- GitHub MCP tool-calling disabled")
+
+        try:
+            yield
+        finally:
+            for task in background_tasks:
+                task.cancel()
+            for task in background_tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            if mcp_client is not None:
+                # Same coroutine that awaited connect() above -- required
+                # by mcp_client.py's close() docstring (anyio cancel
+                # scopes are bound to the task that entered them).
+                # Without this, every server restart leaked an orphan
+                # github-mcp-server subprocess holding a GitHub token in
+                # its environment (see I8 in the final review).
+                await mcp_client.close()
+
+    app = FastAPI(lifespan=lifespan)
+
+    if config.admin_password:
+        app.include_router(create_admin_router(config.db_path, config.admin_password))
+        logger.info("admin UI mounted at /admin")
+    else:
+        # No unauthenticated fallback: an admin UI that edits the system
+        # prompt and shows every transcript is not something to expose
+        # without a password just because none was configured -- it stays
+        # off entirely (ADMIN_PASSWORD unset in .env is "no admin UI", not
+        # "open admin UI").
+        logger.warning("ADMIN_PASSWORD not set -- /admin UI disabled")
 
     @app.websocket("/")
     async def websocket_endpoint(websocket: WebSocket) -> None:
@@ -157,7 +232,6 @@ def create_app(config: Config) -> FastAPI:
                 message = await websocket.receive()
                 if message["type"] == "websocket.disconnect":
                     logger.info("session %s disconnected", session.session_id)
-                    active_session = None
                     break
                 if "text" in message and message["text"] is not None:
                     try:
@@ -212,6 +286,20 @@ def create_app(config: Config) -> FastAPI:
             # actually handles the normal disconnect case with the raw
             # receive() loop used here.
             logger.info("session %s disconnected", session.session_id)
-            active_session = None
+        finally:
+            # Reliably clears active_session no matter how the loop above
+            # exited -- a normal "websocket.disconnect" message, a
+            # WebSocketDisconnect exception, or anything else raised out
+            # of the loop (e.g. send_text()/send_binary() raising on a
+            # half-closed socket) used to leave a dead session registered
+            # forever (see I4 in the final review).
+            #
+            # The identity check matters on its own: on a flaky-WiFi
+            # reconnect, the OLD connection's disconnect handler can run
+            # AFTER a new connection has already registered its own
+            # (live) session -- without this check, the old handler would
+            # null out the new, still-live session's registration.
+            if active_session is session:
+                active_session = None
 
     return app
