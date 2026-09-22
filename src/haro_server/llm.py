@@ -73,20 +73,63 @@ def _strip_code_fence(text: str) -> str:
 
 
 class LiteLlmClient:
-    def __init__(self, model: str, db_path: str) -> None:
+    def __init__(
+        self,
+        model: str,
+        db_path: str,
+        tools: list[dict] | None = None,
+        call_tool=None,
+    ) -> None:
         self._model = model
         self._db_path = db_path
+        self._tools = tools
+        self._call_tool = call_tool
+
+    def set_tools(self, tools: list[dict], call_tool) -> None:
+        """Attaches MCP tools after construction -- server.py's startup
+        event (Task 10) connects to the MCP server asynchronously, which
+        can only happen once uvicorn's event loop is running, by which
+        point this object already exists. The constructor's tools/
+        call_tool parameters above stay for tests and any future case
+        that has tools available up front.
+        """
+        self._tools = tools
+        self._call_tool = call_tool
 
     async def stream_reply(self, transcript: str) -> AsyncIterator[str]:
         messages = [
             {"role": "system", "content": _build_effective_system_prompt(self._db_path)},
             {"role": "user", "content": transcript},
         ]
-        response = await litellm.acompletion(
-            model=self._model,
-            messages=messages,
-            stream=True,
+
+        if not self._tools:
+            response = await litellm.acompletion(model=self._model, messages=messages, stream=True)
+            async for chunk in response:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+            return
+
+        # Tools configured: decide tool use via a non-streamed call first
+        # -- see this task's Context note for why streaming isn't used
+        # for this decision step.
+        decision = await litellm.acompletion(
+            model=self._model, messages=messages, tools=self._tools, tool_choice="auto", stream=False
         )
+        message = decision.choices[0].message
+        if not message.tool_calls:
+            if message.content:
+                yield message.content
+            return
+
+        messages.append(message.model_dump())
+        for tool_call in message.tool_calls:
+            result = await self._call_tool(tool_call)
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+
+        # Follow-up call, no tools offered this time -- a plain streamed
+        # reply, identical in shape to the no-tools-configured path above.
+        response = await litellm.acompletion(model=self._model, messages=messages, stream=True)
         async for chunk in response:
             delta = chunk.choices[0].delta.content
             if delta:

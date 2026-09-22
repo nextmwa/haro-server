@@ -27,6 +27,7 @@ async def _fake_stream(chunks):
 class FakeMessage:
     def __init__(self, content: str) -> None:
         self.content = content
+        self.tool_calls = None
 
 
 class FakeCompletionChoice:
@@ -37,6 +38,34 @@ class FakeCompletionChoice:
 class FakeCompletion:
     def __init__(self, content: str) -> None:
         self.choices = [FakeCompletionChoice(content)]
+
+
+class FakeToolCall:
+    def __init__(self, id: str, name: str, arguments: str = "{}") -> None:
+        self.id = id
+        self.function = FakeToolCallFunction(name, arguments)
+
+
+class FakeToolCallFunction:
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class FakeToolCallMessage:
+    """Stands in for litellm's assistant message when the model decided
+    to call a tool instead of replying directly -- .content is None (no
+    text yet) and .tool_calls carries what to call. model_dump() only
+    needs to round-trip through stream_reply()'s own messages.append()
+    call, not match litellm's real serialization exactly.
+    """
+
+    def __init__(self, tool_calls: list[FakeToolCall]) -> None:
+        self.content = None
+        self.tool_calls = tool_calls
+
+    def model_dump(self):
+        return {"role": "assistant", "tool_calls": self.tool_calls}
 
 
 def _client(tmp_path, model="claude-sonnet-5") -> LiteLlmClient:
@@ -232,3 +261,48 @@ async def test_pick_best_track_returns_none_when_model_returns_negative_index(tm
         picked = await client.pick_best_track("qualcosa di completamente diverso", candidates)
 
     assert picked is None
+
+
+async def test_stream_reply_without_tools_is_unchanged(tmp_path):
+    # Existing behavior: no tools configured -> the original single
+    # streamed call, no tool-calling machinery involved at all.
+    client = _client(tmp_path)
+
+    with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
+        mock_acompletion.return_value = _fake_stream(["[emotion:neutral] ciao"])
+        chunks = [c async for c in client.stream_reply("ciao")]
+
+    assert "".join(chunks) == "[emotion:neutral] ciao"
+    assert mock_acompletion.call_count == 1
+    assert "tools" not in mock_acompletion.call_args.kwargs
+
+
+async def test_stream_reply_calls_a_tool_when_the_model_requests_one(tmp_path):
+    fake_tool_call = FakeToolCall(id="call_1", name="list_pull_requests")
+    decision_response = FakeCompletion("")
+    decision_response.choices[0].message = FakeToolCallMessage([fake_tool_call])
+
+    async def fake_call_tool(tool_call):
+        assert tool_call is fake_tool_call
+        return "2 open pull requests"
+
+    client = _client(tmp_path)
+    client.set_tools(
+        tools=[{"type": "function", "function": {"name": "list_pull_requests"}}],
+        call_tool=fake_call_tool,
+    )
+
+    with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
+        mock_acompletion.side_effect = [
+            decision_response,
+            _fake_stream(["[emotion:neutral] hai 2 PR aperte"]),
+        ]
+        chunks = [c async for c in client.stream_reply("ho PR aperte?")]
+
+    assert "".join(chunks) == "[emotion:neutral] hai 2 PR aperte"
+    assert mock_acompletion.call_count == 2  # one non-streamed decision call, one streamed follow-up
+    first_call, second_call = mock_acompletion.call_args_list
+    assert first_call.kwargs["tools"] == client._tools
+    assert first_call.kwargs["stream"] is False
+    assert second_call.kwargs["stream"] is True
+    assert "tool_call_id" in str(second_call.kwargs["messages"])  # the tool result was folded in
