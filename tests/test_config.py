@@ -37,3 +37,19 @@ def test_from_env_reads_set_values(monkeypatch):
     assert config.default_model == "gpt-5.1"
     assert config.stt_device == "cuda"
     assert config.port == 9000
+
+
+def test_config_defaults_have_no_github_or_calendar_integration():
+    config = Config()
+    assert config.github_token is None
+    assert config.github_repos == []
+    assert config.google_calendar_credentials_path is None
+    assert config.event_poll_interval_seconds == 180
+
+
+def test_config_from_env_reads_github_repos_as_a_comma_separated_list(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_fake")
+    monkeypatch.setenv("GITHUB_REPOS", "acme/web, acme/api")
+    config = Config.from_env()
+    assert config.github_token == "ghp_fake"
+    assert config.github_repos == ["acme/web", "acme/api"]

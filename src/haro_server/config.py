@@ -31,6 +31,16 @@ class Config:
     navidrome_url: str | None = None
     navidrome_username: str | None = None
     navidrome_password: str | None = None
+    # GitHub/Calendar proactive polling (event_poller.py) and GitHub MCP
+    # tool-calling (mcp_client.py) -- unset github_token means both are
+    # inactive, matching navidrome_*'s "unset = disabled" pattern above.
+    github_token: str | None = None
+    github_repos: list[str] = dataclasses.field(default_factory=list)
+    # Path to a Google OAuth credentials/token file (see event_poller.py's
+    # poll_calendar() and the design spec's Configuration section) -- unset
+    # means Calendar polling is inactive.
+    google_calendar_credentials_path: str | None = None
+    event_poll_interval_seconds: int = 180
 
     @staticmethod
     def from_env() -> "Config":
@@ -49,4 +59,8 @@ class Config:
             navidrome_url=os.environ.get("NAVIDROME_URL") or None,
             navidrome_username=os.environ.get("NAVIDROME_USERNAME") or None,
             navidrome_password=os.environ.get("NAVIDROME_PASSWORD") or None,
+            github_token=os.environ.get("GITHUB_TOKEN") or None,
+            github_repos=[r.strip() for r in os.environ.get("GITHUB_REPOS", "").split(",") if r.strip()],
+            google_calendar_credentials_path=os.environ.get("GOOGLE_CALENDAR_CREDENTIALS_PATH") or None,
+            event_poll_interval_seconds=int(os.environ.get("EVENT_POLL_INTERVAL_SECONDS", "180")),
         )
