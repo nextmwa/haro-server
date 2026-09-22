@@ -624,3 +624,63 @@ async def test_handle_interrupt_with_no_active_music_task_is_a_no_op():
     session, *_ = _make_session(llm_chunks=[])
 
     await session.handle_interrupt()  # must not raise
+
+
+async def test_is_busy_false_before_any_turn():
+    session, *_ = _make_session(llm_chunks=["[emotion:neutral] ciao"])
+    assert session.is_busy() is False
+
+
+async def test_is_busy_true_during_a_normal_reply():
+    # A slow-yielding fake LLM lets the test observe is_busy() while
+    # handle_end_of_speech() is still awaiting the TTS stream.
+    busy_during_reply = []
+
+    session, stt, llm, tts, sent_text, sent_binary = _make_session(llm_chunks=[])
+
+    class SlowLlm(FakeLlm):
+        async def _chunk_generator(self):
+            busy_during_reply.append(session.is_busy())
+            yield "[emotion:neutral] ciao"
+
+    session._llm = SlowLlm(chunks=[])
+    await session.handle_end_of_speech()
+
+    assert busy_during_reply == [True]
+    assert session.is_busy() is False  # cleared once the turn finished
+
+
+async def test_is_busy_true_while_a_music_track_is_still_playing():
+    # handle_end_of_speech() returns immediately for a music request
+    # (see session.py's own comment on why) -- is_busy() must still
+    # report True while the background _music_task it spawned is
+    # running, not just while handle_end_of_speech() itself is on the
+    # stack.
+    stt = FakeStt(transcript="metti musica")
+    track = FakeTrack(id="song-1", title="Some Song", artist="Some Artist")
+    llm = FakeLlm(chunks=[], music_query="musica", picked_track_index=0)
+    navidrome = FakeNavidrome(search_results=[track], pcm_chunks=[b"pcm1", b"pcm2"])
+    tts = FakeTts()
+
+    async def send_text(text: str) -> None:
+        pass
+
+    async def send_binary(data: bytes) -> None:
+        pass
+
+    session = Session(stt, llm, tts, send_text, send_binary, navidrome=navidrome)
+
+    await session.handle_end_of_speech()
+    assert session.is_busy() is True  # music_task is running
+
+    await session._music_task
+    assert session.is_busy() is False
+
+
+async def test_speak_announcement_sends_tts_audio_and_response_end():
+    session, stt, llm, tts, sent_text, sent_binary = _make_session(llm_chunks=[])
+
+    await session.speak_announcement("la build e' fallita")
+
+    assert sent_binary  # at least one audio chunk was sent
+    assert any("response_end" in t for t in sent_text)

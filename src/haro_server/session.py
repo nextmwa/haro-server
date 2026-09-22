@@ -69,6 +69,11 @@ class Session:
         # _play_music()/handle_interrupt().
         self._navidrome = navidrome
         self._music_task: asyncio.Task | None = None
+        # See is_busy()/speak_announcement() below -- true only while THIS
+        # object's own synchronous turn-handling is in flight; music's
+        # background task (self._music_task above) is checked separately
+        # since it outlives handle_end_of_speech()'s return.
+        self._reply_in_progress = False
         self.session_id: str | None = None
 
     async def handle_hello(self, session_id: str) -> None:
@@ -79,75 +84,79 @@ class Session:
         self._stt.feed(frame)
 
     async def handle_end_of_speech(self) -> None:
-        transcript = await self._stt.finalize()
-        logger.debug("transcript: %s", transcript)
-
-        if not transcript.strip():
-            # Silence, or a VAD false trigger: nothing was said, so there is
-            # nothing to reply to. Providers reject empty user content, so
-            # driving a full LLM/TTS turn here would just error out. End the
-            # turn cleanly instead so the robot stops waiting.
-            logger.info("empty transcript, skipping LLM/TTS turn")
-            await self._send_text(protocol.encode_response_end())
-            return
-
-        action = actions.match_action(transcript)
-        if action is not None:
-            # Deterministic utility command (dice, coin flip, ...) -- see
-            # actions.py's module docstring for why this bypasses the LLM
-            # entirely rather than asking it to "roll a die" itself.
-            result = action.resolve()
-            logger.info("action matched: %s -> %r", action.name, result)
-            await self._send_text(protocol.encode_action(action.name, result))
-            await self._send_text(protocol.encode_response_end())
-            self._save_transcript(transcript, reply=f"[azione: {action.name} -> {result}]", emotion=None)
-            return
-
-        if music.is_music_request(transcript):
-            # Spawned as a background task, NOT awaited inline: a track can
-            # play for minutes, and the outer server.py receive loop must
-            # stay free to catch an `interrupt` message (wake word firing
-            # mid-song) the whole time -- see handle_interrupt() and this
-            # method's own docstring-length comment on _play_music() for
-            # why this is the one turn type that can't just be a straight
-            # await like every other branch in this method.
-            if self._music_task is not None and not self._music_task.done():
-                self._music_task.cancel()
-            self._music_task = asyncio.create_task(self._play_music(transcript))
-            return
-
-        raw_reply = self._llm.stream_reply(transcript)
-        emotion, text_stream = await _split_emotion_prefix(raw_reply)
-        await self._send_text(protocol.encode_emotion(emotion))
-
-        # Tees the reply text past TTS into `reply_parts` too, so the full
-        # reply is available afterward for the transcript log and fact
-        # extraction below without a second LLM pass.
-        reply_parts: list[str] = []
-        teed_stream = _tee(text_stream, reply_parts)
-
-        tts_stream = self._tts.synthesize(teed_stream)
+        self._reply_in_progress = True
         try:
-            async for chunk in tts_stream:
-                await self._send_binary(chunk)
+            transcript = await self._stt.finalize()
+            logger.debug("transcript: %s", transcript)
+
+            if not transcript.strip():
+                # Silence, or a VAD false trigger: nothing was said, so there is
+                # nothing to reply to. Providers reject empty user content, so
+                # driving a full LLM/TTS turn here would just error out. End the
+                # turn cleanly instead so the robot stops waiting.
+                logger.info("empty transcript, skipping LLM/TTS turn")
+                await self._send_text(protocol.encode_response_end())
+                return
+
+            action = actions.match_action(transcript)
+            if action is not None:
+                # Deterministic utility command (dice, coin flip, ...) -- see
+                # actions.py's module docstring for why this bypasses the LLM
+                # entirely rather than asking it to "roll a die" itself.
+                result = action.resolve()
+                logger.info("action matched: %s -> %r", action.name, result)
+                await self._send_text(protocol.encode_action(action.name, result))
+                await self._send_text(protocol.encode_response_end())
+                self._save_transcript(transcript, reply=f"[azione: {action.name} -> {result}]", emotion=None)
+                return
+
+            if music.is_music_request(transcript):
+                # Spawned as a background task, NOT awaited inline: a track can
+                # play for minutes, and the outer server.py receive loop must
+                # stay free to catch an `interrupt` message (wake word firing
+                # mid-song) the whole time -- see handle_interrupt() and this
+                # method's own docstring-length comment on _play_music() for
+                # why this is the one turn type that can't just be a straight
+                # await like every other branch in this method.
+                if self._music_task is not None and not self._music_task.done():
+                    self._music_task.cancel()
+                self._music_task = asyncio.create_task(self._play_music(transcript))
+                return
+
+            raw_reply = self._llm.stream_reply(transcript)
+            emotion, text_stream = await _split_emotion_prefix(raw_reply)
+            await self._send_text(protocol.encode_emotion(emotion))
+
+            # Tees the reply text past TTS into `reply_parts` too, so the full
+            # reply is available afterward for the transcript log and fact
+            # extraction below without a second LLM pass.
+            reply_parts: list[str] = []
+            teed_stream = _tee(text_stream, reply_parts)
+
+            tts_stream = self._tts.synthesize(teed_stream)
+            try:
+                async for chunk in tts_stream:
+                    await self._send_binary(chunk)
+            finally:
+                # tts_stream, teed_stream, text_stream (the _prepend wrapper),
+                # and raw_reply each only delegate to the next via `async for`,
+                # which does NOT cascade .aclose() through the chain -- so all
+                # four must be closed explicitly, or an aborted turn (e.g. the
+                # robot disconnects mid-reply) leaves generators/connections
+                # suspended until garbage collection eventually gets to them,
+                # instead of closing promptly.
+                await tts_stream.aclose()
+                await teed_stream.aclose()
+                await text_stream.aclose()
+                await raw_reply.aclose()
+
+            await self._send_text(protocol.encode_response_end())
+
+            full_reply = "".join(reply_parts)
+            self._save_transcript(transcript, full_reply, emotion)
+            self._spawn_fact_extraction(transcript, full_reply)
         finally:
-            # tts_stream, teed_stream, text_stream (the _prepend wrapper),
-            # and raw_reply each only delegate to the next via `async for`,
-            # which does NOT cascade .aclose() through the chain -- so all
-            # four must be closed explicitly, or an aborted turn (e.g. the
-            # robot disconnects mid-reply) leaves generators/connections
-            # suspended until garbage collection eventually gets to them,
-            # instead of closing promptly.
-            await tts_stream.aclose()
-            await teed_stream.aclose()
-            await text_stream.aclose()
-            await raw_reply.aclose()
-
-        await self._send_text(protocol.encode_response_end())
-
-        full_reply = "".join(reply_parts)
-        self._save_transcript(transcript, full_reply, emotion)
-        self._spawn_fact_extraction(transcript, full_reply)
+            self._reply_in_progress = False
 
     def _save_transcript(self, transcript: str, reply: str | None, emotion: str | None) -> None:
         if self._db_path is None:
@@ -183,6 +192,30 @@ class Session:
         """
         if self._music_task is not None and not self._music_task.done():
             self._music_task.cancel()
+
+    def is_busy(self) -> bool:
+        return self._reply_in_progress or (self._music_task is not None and not self._music_task.done())
+
+    async def speak_announcement(self, text: str) -> None:
+        """Speaks `text` with no LLM/STT involvement -- used by the
+        proactive-event announcer (event_bus.py's consumer, wired up in
+        Task 7), never by a normal user turn. Callers are responsible for
+        checking is_busy() first; this method does not check it itself,
+        so it can also be used for other non-conversational speech later
+        without re-deriving that policy here.
+        """
+        self._reply_in_progress = True
+        try:
+            await self._send_text(protocol.encode_emotion("neutral"))
+            tts_stream = self._tts.synthesize(_single_chunk(text))
+            try:
+                async for chunk in tts_stream:
+                    await self._send_binary(chunk)
+            finally:
+                await tts_stream.aclose()
+            await self._send_text(protocol.encode_response_end())
+        finally:
+            self._reply_in_progress = False
 
     async def _play_music(self, transcript: str) -> None:
         if self._navidrome is None:
@@ -267,3 +300,7 @@ async def _tee(chunks: AsyncIterator[str], collected: list[str]) -> AsyncIterato
     async for chunk in chunks:
         collected.append(chunk)
         yield chunk
+
+
+async def _single_chunk(text: str) -> AsyncIterator[str]:
+    yield text
