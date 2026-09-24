@@ -94,41 +94,54 @@ async def _poll_one_repo(
     return events
 
 
-async def poll_calendar(service, db_path: str, lookahead_minutes: int = 15) -> list[Event]:
-    """`service` is a Google Calendar API v3 resource, as returned by
+async def poll_calendar(
+    service, db_path: str, label: str, calendar_ids: list[str], lookahead_minutes: int = 15
+) -> list[Event]:
+    """One Google account's worth of polling. `service` is a Google
+    Calendar API v3 resource, as returned by
     `googleapiclient.discovery.build("calendar", "v3", credentials=...)`
-    -- built once at server startup (Task 10) and passed in here, not
-    constructed by this function, so tests can inject a fake with the
-    same `.events().list(**kwargs).execute()` shape. Never raises: same
-    "log and skip this cycle" policy as poll_github above.
+    -- built once per account at server startup (one account's
+    credentials can't list another account's calendars) and passed in
+    here, not constructed by this function, so tests can inject a fake
+    with the same `.events().list(**kwargs).execute()` shape. `label`
+    identifies which account this is in both the dedup key (so the same
+    calendar ID under two different accounts is never conflated) and the
+    spoken announcement, e.g. "[lavoro] tra poco hai: ...". Each calendar
+    in `calendar_ids` is polled independently -- same "log and skip"
+    policy as poll_github's per-repo loop, so one bad calendar ID doesn't
+    take the rest of this account's calendars down with it. Never raises.
     """
-    try:
-        now = datetime.datetime.now(datetime.UTC)
-        time_max = now + datetime.timedelta(minutes=lookahead_minutes)
-        response = service.events().list(
-            calendarId="primary",
-            timeMin=now.isoformat(),
-            timeMax=time_max.isoformat(),
-            singleEvents=True,
-            orderBy="startTime",
-        ).execute()
-    except Exception:
-        logger.exception("Calendar poll failed, skipping this cycle")
-        return []
+    now = datetime.datetime.now(datetime.UTC)
+    time_max = now + datetime.timedelta(minutes=lookahead_minutes)
 
     events: list[Event] = []
-    for item in response.get("items", []):
-        dedup_key = f"calendar:primary:{item['id']}"
-        if db.get_event_dedup_key(db_path, dedup_key) is not None:
-            continue
-        summary = item.get("summary", "un evento")
-        events.append(
-            Event(
-                source="calendar",
-                summary=f"tra poco hai: {summary}",
-                dedup_key=dedup_key,
+    for calendar_id in calendar_ids:
+        try:
+            response = service.events().list(
+                calendarId=calendar_id,
+                timeMin=now.isoformat(),
+                timeMax=time_max.isoformat(),
+                singleEvents=True,
+                orderBy="startTime",
+            ).execute()
+        except Exception:
+            logger.exception(
+                "Calendar poll failed for account=%s calendar=%s, skipping this cycle", label, calendar_id
             )
-        )
-        db.set_event_dedup_key(db_path, dedup_key, "notified")
+            continue
+
+        for item in response.get("items", []):
+            dedup_key = f"calendar:{label}:{calendar_id}:{item['id']}"
+            if db.get_event_dedup_key(db_path, dedup_key) is not None:
+                continue
+            summary = item.get("summary", "un evento")
+            events.append(
+                Event(
+                    source="calendar",
+                    summary=f"[{label}] tra poco hai: {summary}",
+                    dedup_key=dedup_key,
+                )
+            )
+            db.set_event_dedup_key(db_path, dedup_key, "notified")
 
     return events

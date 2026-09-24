@@ -1,6 +1,6 @@
 import numpy as np
 
-from haro_server.pockettts_tts import PocketTtsEngine
+from haro_server.pockettts_tts import PocketTtsEngine, resolve_voice
 
 
 class FakePocketModel:
@@ -71,3 +71,14 @@ def test_synthesize_sentence_converts_flat_tensor_to_pcm16():
     # buffer.
     assert isinstance(pcm, bytes)
     assert len(pcm) % 2 == 0
+
+
+def test_resolve_voice_maps_a_name_to_its_wav_in_the_voices_dir(tmp_path):
+    (tmp_path / "fujiko.wav").write_bytes(b"RIFF")
+    assert resolve_voice("fujiko", voices_dir=str(tmp_path)) == str(tmp_path / "fujiko.wav")
+
+
+def test_resolve_voice_passes_presets_and_paths_through(tmp_path):
+    assert resolve_voice("giovanni", voices_dir=str(tmp_path)) == "giovanni"
+    assert resolve_voice("/some/where/else.wav", voices_dir=str(tmp_path)) == "/some/where/else.wav"
+

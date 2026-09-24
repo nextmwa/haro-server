@@ -7,3 +7,13 @@ __pycache__/
 venv/
 .env
 *.db
+# Google Calendar OAuth tokens (tools/setup_google_calendar.py's output,
+# one file per account -- see google_calendar_accounts.py) -- real,
+# refreshable credentials, same sensitivity as .env's secrets. The accounts
+# list itself names no secret (just labels + calendar IDs + paths to the
+# tokens above) but is still host-specific deployment config, not source.
+google_calendar_token_*.json
+google_calendar_accounts.json
+
+# Cloned TTS voice clips (POCKETTTS_VOICE=<name> -> voices/<name>.wav).
+voices/*.wav*

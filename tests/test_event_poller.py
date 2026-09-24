@@ -111,10 +111,11 @@ async def test_poll_calendar_reports_an_upcoming_meeting(tmp_path):
     service = FakeCalendarService(
         items=[{"id": "evt1", "summary": "Standup", "start": {"dateTime": _soon_iso(10)}}]
     )
-    events = await poll_calendar(service, db_path)
+    events = await poll_calendar(service, db_path, "lavoro", ["primary"])
 
     assert len(events) == 1
     assert "Standup" in events[0].summary
+    assert "[lavoro]" in events[0].summary
 
 
 async def test_poll_calendar_does_not_repeat_an_already_notified_meeting(tmp_path):
@@ -123,7 +124,35 @@ async def test_poll_calendar_does_not_repeat_an_already_notified_meeting(tmp_pat
     service = FakeCalendarService(
         items=[{"id": "evt1", "summary": "Standup", "start": {"dateTime": _soon_iso(10)}}]
     )
-    await poll_calendar(service, db_path)
-    events = await poll_calendar(service, db_path)
+    await poll_calendar(service, db_path, "lavoro", ["primary"])
+    events = await poll_calendar(service, db_path, "lavoro", ["primary"])
 
     assert events == []
+
+
+async def test_poll_calendar_polls_every_calendar_id_for_the_account(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db.init_db(db_path)
+    service = FakeCalendarService(
+        items=[{"id": "evt1", "summary": "Standup", "start": {"dateTime": _soon_iso(10)}}]
+    )
+    events = await poll_calendar(service, db_path, "personale", ["primary", "famiglia@group.calendar.google.com"])
+
+    # Same fake service returns the same item for every calendarId it's
+    # asked about -- two distinct calendar_ids means two distinct events,
+    # not a dedup collision, because the dedup key includes calendar_id.
+    assert len(events) == 2
+
+
+async def test_poll_calendar_same_event_id_under_different_accounts_is_not_conflated(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db.init_db(db_path)
+    service = FakeCalendarService(
+        items=[{"id": "evt1", "summary": "Standup", "start": {"dateTime": _soon_iso(10)}}]
+    )
+    await poll_calendar(service, db_path, "lavoro", ["primary"])
+    events = await poll_calendar(service, db_path, "personale", ["primary"])
+
+    # Same underlying event id ("evt1") but a different account's label --
+    # must still be announced, not skipped as already-seen.
+    assert len(events) == 1

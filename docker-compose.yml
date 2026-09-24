@@ -1,6 +1,15 @@
 services:
   app:
     build: .
+    # Plain published port, NOT `network_mode: host`. Host networking was
+    # tried (2026-09-23) on the theory that Docker Desktop's port-forwarding
+    # proxy was dropping the robot's WebSocket; it wasn't -- the real cause
+    # was internal-RAM exhaustion on the ESP32 (see esp32-firmware's
+    # sdkconfig.defaults, CONFIG_CAMERA_PSRAM_DMA). Host networking also
+    # depends on Docker Desktop's beta "Enable host networking" toggle
+    # (Resources -> Network), which was found switched off after a Docker
+    # Desktop restart on 2026-09-24: the server kept running but was
+    # unreachable from the LAN (robot got "Connection reset by peer").
     ports:
       - "8765:8765"
     env_file:
@@ -23,6 +32,29 @@ services:
       # would without model_cache above. Set DB_PATH=/app/data/haro.db in
       # .env for this to actually land inside the volume.
       - db_data:/app/data
+      # Google Calendar accounts config (google_calendar_accounts.json,
+      # listing every account by label) plus one OAuth token per account
+      # (tools/setup_google_calendar.py's output) -- all gitignored, see
+      # .gitignore's comment. Bind-mounted (not a named volume like the two
+      # above) since these are host-managed files the user re-generates by
+      # re-running that script per account, not container-owned state.
+      # Read-only: the server only ever reads them (google-auth refreshes
+      # each account's access token in memory using its own long-lived
+      # refresh token; nothing here writes the files back).
+      # GOOGLE_CALENDAR_ACCOUNTS_PATH in .env must match the accounts file's
+      # container-side path below, and every credentials_path inside that
+      # JSON file must match one of the token mounts below -- add a new
+      # mount line here for each new account (see tools/setup_google_
+      # calendar.py's own docstring for how to produce a new account's
+      # token file).
+      - ./google_calendar_accounts.json:/app/google_calendar_accounts.json:ro
+      - ./google_calendar_token_personale.json:/app/google_calendar_token_personale.json:ro
+      - ./google_calendar_token_lavoro.json:/app/google_calendar_token_lavoro.json:ro
+      - ./google_calendar_token_lavoro2.json:/app/google_calendar_token_lavoro2.json:ro
+      # Cloned TTS voices: POCKETTTS_VOICE=<name> in .env picks
+      # voices/<name>.wav (pockettts_tts.py's resolve_voice()). Drop a new
+      # 10-30s clean mono WAV here to add a voice, then restart the server.
+      - ./voices:/app/voices:ro
 
 volumes:
   model_cache:

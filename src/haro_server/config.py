@@ -22,6 +22,12 @@ class Config:
     # Defaults to "kokoro" (the original, lighter engine) so nothing
     # changes for a deployment that doesn't set this explicitly.
     tts_engine: str = "kokoro"
+    # Voice for TTS_ENGINE=pockettts only (ignored by the other engines):
+    # either one of Pocket TTS's built-in preset names (e.g. "giovanni", its
+    # only Italian preset) or a path/URL to a short WAV to clone the voice
+    # from -- passed straight to TTSModel.get_state_for_audio_prompt(), see
+    # pockettts_tts.py.
+    pockettts_voice: str = "giovanni"
     host: str = "0.0.0.0"
     port: int = 8765
     db_path: str = "haro.db"
@@ -42,10 +48,12 @@ class Config:
     # inactive, matching navidrome_*'s "unset = disabled" pattern above.
     github_token: str | None = None
     github_repos: list[str] = dataclasses.field(default_factory=list)
-    # Path to a Google OAuth credentials/token file (see event_poller.py's
-    # poll_calendar() and the design spec's Configuration section) -- unset
-    # means Calendar polling is inactive.
-    google_calendar_credentials_path: str | None = None
+    # Path to a JSON file listing one or more Google Calendar accounts to
+    # poll (see google_calendar_accounts.py's load_accounts() and
+    # .env.example) -- unset means Calendar polling is inactive. Each
+    # account has its own OAuth token (a Google account's credentials
+    # can't be shared across accounts) and its own list of calendar IDs.
+    google_calendar_accounts_path: str | None = None
     event_poll_interval_seconds: int = 180
 
     def __repr__(self) -> str:
@@ -75,6 +83,7 @@ class Config:
             stt_device=os.environ.get("STT_DEVICE", "cpu"),
             tts_device=os.environ.get("TTS_DEVICE", "cpu"),
             tts_engine=os.environ.get("TTS_ENGINE", "kokoro"),
+            pockettts_voice=os.environ.get("POCKETTTS_VOICE") or "giovanni",
             host=os.environ.get("HOST", "0.0.0.0"),
             port=int(os.environ.get("PORT", "8765")),
             db_path=os.environ.get("DB_PATH", "haro.db"),
@@ -84,6 +93,6 @@ class Config:
             navidrome_password=os.environ.get("NAVIDROME_PASSWORD") or None,
             github_token=os.environ.get("GITHUB_TOKEN") or None,
             github_repos=[r.strip() for r in os.environ.get("GITHUB_REPOS", "").split(",") if r.strip()],
-            google_calendar_credentials_path=os.environ.get("GOOGLE_CALENDAR_CREDENTIALS_PATH") or None,
+            google_calendar_accounts_path=os.environ.get("GOOGLE_CALENDAR_ACCOUNTS_PATH") or None,
             event_poll_interval_seconds=int(os.environ.get("EVENT_POLL_INTERVAL_SECONDS", "180")),
         )

@@ -39,11 +39,19 @@ def test_from_env_reads_set_values(monkeypatch):
     assert config.port == 9000
 
 
+def test_pockettts_voice_defaults_to_giovanni_and_reads_env(monkeypatch):
+    monkeypatch.delenv("POCKETTTS_VOICE", raising=False)
+    assert Config.from_env().pockettts_voice == "giovanni"
+
+    monkeypatch.setenv("POCKETTTS_VOICE", "/app/voices/sara.wav")
+    assert Config.from_env().pockettts_voice == "/app/voices/sara.wav"
+
+
 def test_config_defaults_have_no_github_or_calendar_integration():
     config = Config()
     assert config.github_token is None
     assert config.github_repos == []
-    assert config.google_calendar_credentials_path is None
+    assert config.google_calendar_accounts_path is None
     assert config.event_poll_interval_seconds == 180
 
 

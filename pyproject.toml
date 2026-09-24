@@ -25,6 +25,13 @@ dependencies = [
     # little benefit.
     "google-api-python-client>=2.100.0",
     "google-auth>=2.23.0",
+    # Only actually used by tools/setup_google_calendar.py (the one-time,
+    # interactive OAuth authorization script) -- not imported anywhere in
+    # the server's own runtime path. Kept as a normal dependency rather
+    # than split into an optional extras group: it's small, and splitting
+    # it would be the only optional-extras group in this project for one
+    # rarely-run script, not worth the added complexity (YAGNI).
+    "google-auth-oauthlib>=1.2.0",
     # face_tracking.py's server-side face detection (moved here from the
     # ESP32 firmware: the on-device esp-dl models either missed faces
     # unreliably (2-stage MSRMNP) or crashed the board with ESP_ERR_NO_MEM

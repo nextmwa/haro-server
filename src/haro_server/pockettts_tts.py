@@ -1,7 +1,28 @@
 import asyncio
+import os
 from typing import AsyncIterator
 
 from .tts_common import as_numpy, find_sentence_boundary, resample_to_device_rate, to_pcm16
+
+
+# Where custom cloned voices live inside the container (bind-mounted from
+# server/voices/ by docker-compose.yml). A voice named "fujiko" is the file
+# voices/fujiko.wav -- see resolve_voice().
+VOICES_DIR = "/app/voices"
+
+
+def resolve_voice(voice: str, voices_dir: str = VOICES_DIR) -> str:
+    """Map POCKETTTS_VOICE to what get_state_for_audio_prompt() accepts.
+
+    A bare name with a matching <voices_dir>/<name>.wav is a custom cloned
+    voice and resolves to that file's path; anything else (a built-in preset
+    like "giovanni", an explicit path, a URL) passes through unchanged.
+    """
+    if "/" not in voice:
+        candidate = os.path.join(voices_dir, f"{voice}.wav")
+        if os.path.isfile(candidate):
+            return candidate
+    return voice
 
 
 class PocketTtsEngine:
@@ -46,7 +67,7 @@ class PocketTtsEngine:
         # timbre, prepared once here and reused for every sentence rather
         # than re-derived per call). "giovanni" is Pocket TTS's own
         # built-in Italian voice preset -- see its docs' voice list.
-        self._voice_state = self._model.get_state_for_audio_prompt(voice)
+        self._voice_state = self._model.get_state_for_audio_prompt(resolve_voice(voice))
         # Measured on the real installed package: the first
         # generate_audio() call after loading a quantized model pays a
         # one-off ~8s cost (kernel/cache warm-up), then every later call

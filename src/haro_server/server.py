@@ -12,6 +12,7 @@ from .chatterbox_tts import ChatterboxTtsEngine
 from .config import Config
 from .event_bus import EventBus
 from .event_poller import poll_calendar, poll_github
+from .google_calendar_accounts import load_accounts
 from .llm import LiteLlmClient
 from .navidrome import NavidromeClient
 from .pockettts_tts import PocketTtsEngine
@@ -34,7 +35,7 @@ def _build_tts_engine(config: Config):
         # No device= here: Pocket TTS is CPU-first by design (its docs:
         # "a TTS that fits in your CPU") and TTSModel.load_model() takes
         # no device kwarg -- see pockettts_tts.py.
-        return PocketTtsEngine()
+        return PocketTtsEngine(voice=config.pockettts_voice)
     if config.tts_engine == "kokoro":
         return KokoroTtsEngine(device=config.tts_device)
     raise ValueError(
@@ -50,7 +51,7 @@ def create_app(config: Config) -> FastAPI:
     # immediately rather than lazily on the first robot connection.
     logger.info("loading STT model (device=%s)...", config.stt_device)
     stt_model = load_parakeet_model(device=config.stt_device)
-    logger.info("loading TTS model (engine=%s, device=%s)...", config.tts_engine, config.tts_device)
+    logger.info("loading TTS model (engine=%s, device=%s, pockettts_voice=%s)...", config.tts_engine, config.tts_device, config.pockettts_voice)
     tts = _build_tts_engine(config)
     llm = LiteLlmClient(model=config.default_model, db_path=config.db_path)
     logger.info("models loaded, ready to accept connections")
@@ -73,25 +74,37 @@ def create_app(config: Config) -> FastAPI:
         return active_session
 
     async def run_scheduler() -> None:
-        calendar_service = None
-        if config.google_calendar_credentials_path:
+        # (label, service, calendar_ids) for every account whose token
+        # loaded and whose client built successfully. One account's bad
+        # or expired token must degrade only that account's polling --
+        # not the other accounts, and not GitHub polling either (this
+        # used to run before the loop with no guard at all, so any
+        # failure here killed run_scheduler() entirely -- see C2 in the
+        # final review, which this per-account loop preserves).
+        calendar_accounts = []
+        if config.google_calendar_accounts_path:
             try:
                 from google.oauth2.credentials import Credentials
                 from googleapiclient.discovery import build
 
-                credentials = Credentials.from_authorized_user_file(config.google_calendar_credentials_path)
-                calendar_service = build("calendar", "v3", credentials=credentials)
+                accounts = load_accounts(config.google_calendar_accounts_path)
             except Exception:
-                # A bad credentials path or malformed token file must
-                # degrade Calendar polling only -- it must not also take
-                # GitHub polling down with it (this used to run before
-                # the loop with no guard at all, so any failure here
-                # killed run_scheduler() entirely -- see C2 in the final
-                # review).
                 logger.exception(
-                    "failed to initialize the Google Calendar client -- Calendar polling disabled"
+                    "failed to load %s -- Calendar polling disabled",
+                    config.google_calendar_accounts_path,
                 )
-                calendar_service = None
+                accounts = []
+            for account in accounts:
+                try:
+                    credentials = Credentials.from_authorized_user_file(account.credentials_path)
+                    service = build("calendar", "v3", credentials=credentials)
+                    calendar_accounts.append((account.label, service, account.calendar_ids))
+                except Exception:
+                    logger.exception(
+                        "failed to initialize the Google Calendar client for account=%s -- "
+                        "this account's polling disabled",
+                        account.label,
+                    )
 
         import httpx
 
@@ -103,8 +116,8 @@ def create_app(config: Config) -> FastAPI:
                             client, config.db_path, config.github_token, config.github_repos
                         ):
                             event_bus.publish(event)
-                    if calendar_service is not None:
-                        for event in await poll_calendar(calendar_service, config.db_path):
+                    for label, service, calendar_ids in calendar_accounts:
+                        for event in await poll_calendar(service, config.db_path, label, calendar_ids):
                             event_bus.publish(event)
                 except Exception:
                     # Never let one bad poll cycle kill this task
@@ -138,7 +151,7 @@ def create_app(config: Config) -> FastAPI:
         # the same asyncio task that awaited connect() (see its own
         # docstring).
         background_tasks: list[asyncio.Task] = []
-        if config.github_token or config.google_calendar_credentials_path:
+        if config.github_token or config.google_calendar_accounts_path:
             scheduler_task = asyncio.create_task(run_scheduler())
             announcer_task = asyncio.create_task(run_announcer(event_bus, get_active_session))
             scheduler_task.add_done_callback(_log_if_task_exited_unexpectedly("run_scheduler"))
