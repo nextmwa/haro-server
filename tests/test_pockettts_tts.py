@@ -1,6 +1,7 @@
 import numpy as np
 
 from haro_server.pockettts_tts import PocketTtsEngine, resolve_voice
+from haro_server.tts_common import DEVICE_SAMPLE_RATE
 
 
 class FakePocketModel:
@@ -16,6 +17,14 @@ class FakePocketModel:
         # Real generate_audio() returns a flat 1-D tensor, unlike
         # Chatterbox's (1, num_samples) -- no squeeze() needed downstream.
         return np.full(10, 0.1, dtype=np.float32)
+
+    def generate_audio_stream(self, voice_state, text: str):
+        self.calls.append((voice_state, text))
+        # Real Pocket TTS yields one Mimi frame per chunk: 80ms at 24kHz.
+        for _ in range(self.stream_chunks_per_sentence):
+            yield np.full(1920, 0.1, dtype=np.float32)
+
+    stream_chunks_per_sentence = 2
 
 
 async def _text_stream(chunks: list[str]):
@@ -39,8 +48,41 @@ async def test_synthesize_flushes_on_sentence_boundaries():
         ("voice-state:giovanni", "Ciao! "),
         ("voice-state:giovanni", "Come stai?"),
     ]
-    assert len(chunks) == 2
+    assert len(chunks) >= 2
     assert all(isinstance(c, bytes) for c in chunks)
+
+
+async def test_synthesize_sends_frames_immediately_until_ahead_then_coalesces():
+    engine = _fake_engine()
+    # 150 x 80ms = 12s of audio, generated instantly (far above real time).
+    engine._model.stream_chunks_per_sentence = 150
+
+    chunks = [c async for c in engine.synthesize(_text_stream(["Una frase lunga."]))]
+
+    seconds = [len(c) / 2 / DEVICE_SAMPLE_RATE for c in chunks]
+    # First send: one frame, not a whole sentence -- the robot starts
+    # talking as soon as possible.
+    assert seconds[0] < 0.2
+    # Once the robot has 1s+ queued, sends are coalesced to >=1s, so the
+    # firmware's 32-slot event queue can't be flooded with 80ms frames.
+    assert all(s >= 1.0 for s in seconds[-5:-1])
+    assert len(chunks) < 32
+    # No audio lost or duplicated by the streaming resampler.
+    assert abs(sum(seconds) - 12.0) < 0.05
+
+
+async def test_synthesize_keeps_sending_frames_immediately_while_not_ahead(monkeypatch):
+    engine = _fake_engine()
+    engine._model.stream_chunks_per_sentence = 10
+    # An unreachable "ahead" threshold: the robot is never far enough
+    # ahead, as when generation only just keeps up with playback -- every
+    # frame must go out right away, never held back to build a bigger send.
+    import haro_server.pockettts_tts as mod
+    monkeypatch.setattr(mod, "STREAM_COALESCE_SECONDS", 1e6)
+
+    chunks = [c async for c in engine.synthesize(_text_stream(["Frase."]))]
+
+    assert all(len(c) / 2 / DEVICE_SAMPLE_RATE < 0.2 for c in chunks)
 
 
 async def test_synthesize_uses_the_configured_voice_state():
@@ -57,7 +99,7 @@ async def test_synthesize_flushes_trailing_text_without_a_terminator():
     chunks = [c async for c in engine.synthesize(_text_stream(["nessun punto finale"]))]
 
     assert engine._model.calls == [("voice-state:giovanni", "nessun punto finale")]
-    assert len(chunks) == 1
+    assert len(chunks) >= 1
 
 
 def test_synthesize_sentence_converts_flat_tensor_to_pcm16():

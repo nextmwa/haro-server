@@ -47,6 +47,16 @@ def test_pockettts_voice_defaults_to_giovanni_and_reads_env(monkeypatch):
     assert Config.from_env().pockettts_voice == "/app/voices/sara.wav"
 
 
+def test_pockettts_quantize_defaults_true_and_reads_false_values(monkeypatch):
+    monkeypatch.delenv("POCKETTTS_QUANTIZE", raising=False)
+    assert Config.from_env().pockettts_quantize is True
+    for value in ("false", "False", "0", "no"):
+        monkeypatch.setenv("POCKETTTS_QUANTIZE", value)
+        assert Config.from_env().pockettts_quantize is False
+    monkeypatch.setenv("POCKETTTS_QUANTIZE", "true")
+    assert Config.from_env().pockettts_quantize is True
+
+
 def test_config_defaults_have_no_github_or_calendar_integration():
     config = Config()
     assert config.github_token is None

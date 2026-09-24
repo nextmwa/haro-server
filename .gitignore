@@ -17,3 +17,9 @@ google_calendar_accounts.json
 
 # Cloned TTS voice clips (POCKETTTS_VOICE=<name> -> voices/<name>.wav).
 voices/*.wav*
+
+# Native server (haroctl): logs and the SQLite data dir.
+logs/
+data/
+# Pre-native-migration backups of .env / calendar accounts (contain secrets).
+*.bak-docker

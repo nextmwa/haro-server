@@ -1,0 +1,150 @@
+#!/bin/bash
+# haroctl -- run haro-server natively on macOS (no Docker), as a launchd
+# user agent that starts at login and restarts after a crash, while staying
+# fully controllable by hand.
+#
+# Why native: Pocket TTS runs ~3x faster outside Docker's Linux VM on Apple
+# Silicon (2026-09-24 benchmark -- see pockettts_tts.py's docstring).
+#
+#   ./haroctl install     write the launchd agent and start it (autostart at login)
+#   ./haroctl uninstall   stop it and remove the launchd agent
+#   ./haroctl start       start the server (as the launchd agent)
+#   ./haroctl stop        stop it; stays stopped until `start` or next login
+#   ./haroctl restart     restart it (e.g. after changing .env or the code)
+#   ./haroctl status      launchd state, PID, and whether port 8765 answers
+#   ./haroctl logs        follow the server log (Ctrl+C to exit)
+#   ./haroctl run         run in the foreground in this terminal (Ctrl+C
+#                         kills it) -- refuses while the agent is running
+set -euo pipefail
+
+LABEL="com.haro.server"
+SERVER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="$SERVER_DIR/.venv/bin/python"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="$SERVER_DIR/logs"
+LOG_FILE="$LOG_DIR/haro-server.log"
+DOMAIN="gui/$(id -u)"
+# espeak-ng/ffmpeg come from Homebrew; launchd's default PATH lacks it.
+RUN_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+port() {
+    local p
+    p=$(grep -E '^PORT=' "$SERVER_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2)
+    echo "${p:-8765}"
+}
+
+is_loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
+
+check_prereqs() {
+    [[ -x "$PYTHON" ]] || { echo "missing $PYTHON -- create it with: uv venv --python 3.11 .venv && uv pip install --python .venv/bin/python -e ." >&2; exit 1; }
+    [[ -f "$SERVER_DIR/.env" ]] || { echo "missing $SERVER_DIR/.env" >&2; exit 1; }
+}
+
+warn_if_docker_running() {
+    if command -v docker >/dev/null 2>&1 && \
+       docker ps --filter "name=server-app" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+        echo "warning: the Docker container server-app-1 is running and holds port $(port)." >&2
+        echo "         stop it first: (cd $SERVER_DIR && docker compose stop)" >&2
+    fi
+}
+
+write_plist() {
+    mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PYTHON</string>
+        <string>-m</string>
+        <string>haro_server.main</string>
+    </array>
+    <key>WorkingDirectory</key><string>$SERVER_DIR</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HARO_ENV_FILE</key><string>$SERVER_DIR/.env</string>
+        <key>PATH</key><string>$RUN_PATH</string>
+        <key>PYTHONUNBUFFERED</key><string>1</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <!-- Restart after a crash, but not after a clean exit. -->
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>$LOG_FILE</string>
+    <key>StandardErrorPath</key><string>$LOG_FILE</string>
+</dict>
+</plist>
+EOF
+}
+
+cmd_start() {
+    check_prereqs
+    [[ -f "$PLIST" ]] || write_plist
+    warn_if_docker_running
+    if is_loaded; then
+        launchctl kickstart "$DOMAIN/$LABEL"
+    else
+        launchctl bootstrap "$DOMAIN" "$PLIST"
+    fi
+    is_loaded || { echo "failed to start: launchd agent not loaded" >&2; exit 1; }
+    echo "started -- models take ~30-60s to load; follow with: $0 logs"
+}
+
+cmd_stop() {
+    if is_loaded; then
+        launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+        # bootout returns before the service is actually gone (the server
+        # shuts down gracefully first); bootstrapping again in that window
+        # gets undone by the still-running bootout -- found by a `restart`
+        # that printed "started" but left nothing running.
+        local i
+        for i in $(seq 1 60); do
+            is_loaded || break
+            sleep 0.5
+        done
+        if is_loaded; then echo "still stopping after 30s" >&2; exit 1; fi
+        echo "stopped"
+    else
+        echo "not running"
+    fi
+}
+
+cmd_status() {
+    if is_loaded; then
+        local pid
+        pid=$(launchctl print "$DOMAIN/$LABEL" | awk '/^\tpid = /{print $3}')
+        echo "launchd agent: loaded${pid:+, pid $pid}"
+    else
+        echo "launchd agent: not loaded"
+    fi
+    if curl -s -m 2 -o /dev/null "http://127.0.0.1:$(port)/"; then
+        echo "port $(port): answering"
+    else
+        echo "port $(port): not answering (stopped, or still loading models)"
+    fi
+}
+
+case "${1:-}" in
+    install)   check_prereqs; write_plist; cmd_stop >/dev/null; cmd_start ;;
+    uninstall) cmd_stop; rm -f "$PLIST"; echo "removed $PLIST" ;;
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    restart)   cmd_stop; cmd_start ;;
+    status)    cmd_status ;;
+    logs)      mkdir -p "$LOG_DIR"; touch "$LOG_FILE"; tail -n 50 -f "$LOG_FILE" ;;
+    run)
+        check_prereqs
+        if is_loaded; then echo "the launchd agent is running -- '$0 stop' first" >&2; exit 1; fi
+        warn_if_docker_running
+        cd "$SERVER_DIR"
+        HARO_ENV_FILE="$SERVER_DIR/.env" PATH="$RUN_PATH" exec "$PYTHON" -m haro_server.main
+        ;;
+    *)
+        awk 'NR>1 && /^#/{sub(/^# ?/,""); print; next} NR>1{exit}' "$0"
+        exit 1
+        ;;
+esac

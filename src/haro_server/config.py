@@ -28,6 +28,9 @@ class Config:
     # from -- passed straight to TTSModel.get_state_for_audio_prompt(), see
     # pockettts_tts.py.
     pockettts_voice: str = "giovanni"
+    # int8-quantize Pocket TTS (see PocketTtsEngine's docstring): faster
+    # inside Docker, ~2.5x SLOWER than fp32 natively on Apple Silicon.
+    pockettts_quantize: bool = True
     host: str = "0.0.0.0"
     port: int = 8765
     db_path: str = "haro.db"
@@ -84,6 +87,7 @@ class Config:
             tts_device=os.environ.get("TTS_DEVICE", "cpu"),
             tts_engine=os.environ.get("TTS_ENGINE", "kokoro"),
             pockettts_voice=os.environ.get("POCKETTTS_VOICE") or "giovanni",
+            pockettts_quantize=os.environ.get("POCKETTTS_QUANTIZE", "true").strip().lower() not in ("0", "false", "no"),
             host=os.environ.get("HOST", "0.0.0.0"),
             port=int(os.environ.get("PORT", "8765")),
             db_path=os.environ.get("DB_PATH", "haro.db"),

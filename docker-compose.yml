@@ -14,6 +14,11 @@ services:
       - "8765:8765"
     env_file:
       - .env
+    environment:
+      # .env is shared with the native server (haroctl), which runs Pocket
+      # TTS in fp32; inside Docker's Linux VM int8 is the fast one -- see
+      # PocketTtsEngine's docstring.
+      POCKETTTS_QUANTIZE: "true"
     restart: unless-stopped
     volumes:
       # Model weights are multi-GB and downloaded on first use, not baked

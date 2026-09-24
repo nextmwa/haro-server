@@ -35,7 +35,7 @@ def _build_tts_engine(config: Config):
         # No device= here: Pocket TTS is CPU-first by design (its docs:
         # "a TTS that fits in your CPU") and TTSModel.load_model() takes
         # no device kwarg -- see pockettts_tts.py.
-        return PocketTtsEngine(voice=config.pockettts_voice)
+        return PocketTtsEngine(voice=config.pockettts_voice, quantize=config.pockettts_quantize)
     if config.tts_engine == "kokoro":
         return KokoroTtsEngine(device=config.tts_device)
     raise ValueError(
@@ -51,7 +51,10 @@ def create_app(config: Config) -> FastAPI:
     # immediately rather than lazily on the first robot connection.
     logger.info("loading STT model (device=%s)...", config.stt_device)
     stt_model = load_parakeet_model(device=config.stt_device)
-    logger.info("loading TTS model (engine=%s, device=%s, pockettts_voice=%s)...", config.tts_engine, config.tts_device, config.pockettts_voice)
+    logger.info(
+        "loading TTS model (engine=%s, device=%s, pockettts_voice=%s, pockettts_quantize=%s)...",
+        config.tts_engine, config.tts_device, config.pockettts_voice, config.pockettts_quantize,
+    )
     tts = _build_tts_engine(config)
     llm = LiteLlmClient(model=config.default_model, db_path=config.db_path)
     logger.info("models loaded, ready to accept connections")

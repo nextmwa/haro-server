@@ -6,6 +6,10 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
+    # main.py loads .env itself when run natively (HARO_ENV_FILE, set by
+    # haroctl/launchd). Already pulled in by uvicorn[standard]; declared
+    # directly since main.py imports it by name.
+    "python-dotenv>=1.0.0",
     "websockets>=12.0",
     # FastAPI's Form(...) parsing (admin.py's system-prompt save form)
     # requires this at runtime -- FastAPI only raises if it's missing when
@@ -71,6 +75,11 @@ dependencies = [
     # declared directly since tts_common.py imports it by name and that
     # shouldn't depend on nemo's dependency tree shape.
     "librosa>=0.10.0",
+    # Stateful streaming resampler for pockettts_tts.py's streamed frames
+    # (librosa.resample is one-shot and would click at frame boundaries).
+    # Already a librosa dependency; declared directly for the same reason
+    # as librosa above.
+    "soxr>=0.3.0",
     # nemo_toolkit[asr] provides the Parakeet STT model (stt.py). Verified
     # (see task-7-report.md) that `nemo_toolkit>=2.0.0` and its `asr` extra
     # both really exist on PyPI (unlike Task 6's `kokoro>=1.0`, which
