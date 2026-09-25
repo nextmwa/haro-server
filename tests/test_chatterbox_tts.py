@@ -32,7 +32,7 @@ async def test_synthesize_flushes_on_sentence_boundaries():
 
     chunks = [c async for c in engine.synthesize(_text_stream(["Ciao! ", "Come stai?"]))]
 
-    assert engine._model.calls == [("Ciao! ", "it"), ("Come stai?", "it")]
+    assert engine._model.calls == [("Ciao!", "it"), ("Come stai?", "it")]
     assert len(chunks) == 2
     assert all(isinstance(c, bytes) for c in chunks)
 
@@ -42,7 +42,7 @@ async def test_synthesize_passes_the_configured_language_id():
 
     [_ async for _ in engine.synthesize(_text_stream(["Bonjour! "]))]
 
-    assert engine._model.calls == [("Bonjour! ", "fr")]
+    assert engine._model.calls == [("Bonjour!", "fr")]
 
 
 async def test_synthesize_flushes_trailing_text_without_a_terminator():
@@ -50,7 +50,7 @@ async def test_synthesize_flushes_trailing_text_without_a_terminator():
 
     chunks = [c async for c in engine.synthesize(_text_stream(["nessun punto finale"]))]
 
-    assert engine._model.calls == [("nessun punto finale", "it")]
+    assert engine._model.calls == [("nessun punto finale.", "it")]
     assert len(chunks) == 1
 
 

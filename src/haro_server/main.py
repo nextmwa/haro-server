@@ -22,7 +22,10 @@ def main() -> None:
         load_dotenv(env_file, override=False)
     config = Config.from_env()
     app = create_app(config)
-    uvicorn.run(app, host=config.host, port=config.port, loop="uvloop")
+    # Bounded graceful shutdown: by default uvicorn waits indefinitely for
+    # in-flight work (a streaming reply, an LLM call) while keeping the port
+    # bound, so a restart's new process couldn't bind for ~60s.
+    uvicorn.run(app, host=config.host, port=config.port, loop="uvloop", timeout_graceful_shutdown=5)
 
 
 if __name__ == "__main__":

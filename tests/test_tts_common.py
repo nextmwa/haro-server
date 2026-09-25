@@ -42,3 +42,41 @@ def test_resample_to_device_rate_is_a_no_op_when_already_at_device_rate():
     audio = np.zeros(DEVICE_SAMPLE_RATE, dtype=np.float32)
     resampled = resample_to_device_rate(audio, orig_sr=DEVICE_SAMPLE_RATE)
     assert resampled is audio
+
+
+from haro_server.tts_common import clean_for_speech  # noqa: E402
+
+
+def test_a_newline_ends_a_sentence_so_list_items_are_spoken_separately():
+    text = "Ti butto qualche idea:\n- Serata film\n- Uscita tranquilla\n"
+    first = find_sentence_boundary(text)
+    assert text[:first].strip() == "Ti butto qualche idea:"
+
+
+def test_clean_for_speech_strips_list_markers_and_adds_a_closing_pause():
+    assert clean_for_speech("- Serata film o serie con snack e copertina\n") == "Serata film o serie con snack e copertina."
+    assert clean_for_speech("* Hobby: libro, videogiochi\n") == "Hobby: libro, videogiochi."
+    assert clean_for_speech("• Relax totale") == "Relax totale."
+    assert clean_for_speech("2. Uscita tranquilla") == "Uscita tranquilla."
+
+
+def test_clean_for_speech_keeps_question_and_exclamation_marks():
+    assert clean_for_speech("Sei più da casa o da uscire? ") == "Sei più da casa o da uscire?"
+    assert clean_for_speech("Dipende da che umore hai stasera! ") == "Dipende da che umore hai stasera!"
+
+
+def test_clean_for_speech_turns_a_trailing_colon_into_a_pause():
+    assert clean_for_speech("Ti butto qualche idea veloce, poi mi dici cosa ti ispira:\n") == (
+        "Ti butto qualche idea veloce, poi mi dici cosa ti ispira."
+    )
+
+
+def test_clean_for_speech_removes_markdown_quotes_and_emoji():
+    assert clean_for_speech("**Serata “cucina”**: provi una ricetta 🍕\n") == "Serata cucina: provi una ricetta."
+    assert clean_for_speech("## Consigli\n") == "Consigli."
+    assert clean_for_speech("usa `ls` nel terminale.") == "usa ls nel terminale."
+
+
+def test_clean_for_speech_of_a_bare_marker_is_empty():
+    assert clean_for_speech("- \n") == ""
+    assert clean_for_speech("   ") == ""

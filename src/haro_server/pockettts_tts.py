@@ -5,7 +5,7 @@ from typing import AsyncIterator
 import numpy as np
 import soxr
 
-from .tts_common import DEVICE_SAMPLE_RATE, as_numpy, find_sentence_boundary, resample_to_device_rate, to_pcm16
+from .tts_common import DEVICE_SAMPLE_RATE, as_numpy, resample_to_device_rate, speakable_sentences, to_pcm16
 
 # Streaming output sizing (see PocketTtsEngine.synthesize()). While the
 # robot has less than this much audio queued ahead of playback, every
@@ -120,17 +120,8 @@ class PocketTtsEngine:
             return audio
 
         async def frames_for_text() -> AsyncIterator[np.ndarray]:
-            buffer = ""
-            async for chunk in text_stream:
-                buffer += chunk
-                boundary = find_sentence_boundary(buffer)
-                while boundary is not None:
-                    sentence, buffer = buffer[:boundary], buffer[boundary:]
-                    async for frame in self._stream_sentence(sentence):
-                        yield frame
-                    boundary = find_sentence_boundary(buffer)
-            if buffer.strip():
-                async for frame in self._stream_sentence(buffer):
+            async for sentence in speakable_sentences(text_stream):
+                async for frame in self._stream_sentence(sentence):
                     yield frame
 
         async for frame in frames_for_text():

@@ -7,12 +7,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from . import camera_preview, db, face_tracking, protocol
 from .admin import create_admin_router
+from .alarms import run_alarms
 from .announcer import run_announcer
 from .chatterbox_tts import ChatterboxTtsEngine
 from .config import Config
 from .event_bus import EventBus
+from .assistant_tools import AssistantTools, CombinedTools
 from .event_poller import poll_calendar, poll_github
-from .google_calendar_accounts import load_accounts
+from .google_calendar_accounts import build_calendar_services
 from .llm import LiteLlmClient
 from .navidrome import NavidromeClient
 from .pockettts_tts import PocketTtsEngine
@@ -43,6 +45,46 @@ def _build_tts_engine(config: Config):
     )
 
 
+# Bytes per second of the robot's playback format: 16kHz mono PCM16.
+_PLAYBACK_BYTES_PER_SECOND = 16000 * 2
+# How far ahead of the robot's playback the server may get. The robot
+# buffers 3s (firmware audio_player.c); 1.5s absorbs network jitter while
+# leaving half of that buffer free.
+MAX_AUDIO_LEAD_SECONDS = 1.5
+
+
+class AudioPacer:
+    """Keeps an audio stream from getting more than MAX_AUDIO_LEAD_SECONDS
+    ahead of real-time playback on the robot.
+
+    Found on real hardware (2026-09-24): native Pocket TTS generates ~3x
+    faster than real time (music streams even faster), and sending as fast
+    as it was generated overflowed the robot's buffers -- dropped chunks
+    ("random blocks" of speech) and a lost response_end. The robot has no
+    flow control of its own, so the server paces instead.
+
+    Assumes playback starts when the first byte of a stream is sent; a new
+    stream begins whenever the previous one has finished playing.
+    """
+
+    def __init__(self, clock=None, sleep=None) -> None:
+        self._clock = clock or asyncio.get_running_loop().time
+        self._sleep = sleep or asyncio.sleep
+        self._stream_start = 0.0
+        self._sent_seconds = 0.0
+
+    async def wait_before_sending(self, nbytes: int) -> None:
+        now = self._clock()
+        if now >= self._stream_start + self._sent_seconds:
+            # Previous stream (if any) has played out: this starts a new one.
+            self._stream_start = now
+            self._sent_seconds = 0.0
+        lead = self._stream_start + self._sent_seconds - now
+        if lead > MAX_AUDIO_LEAD_SECONDS:
+            await self._sleep(lead - MAX_AUDIO_LEAD_SECONDS)
+        self._sent_seconds += nbytes / _PLAYBACK_BYTES_PER_SECOND
+
+
 def create_app(config: Config) -> FastAPI:
     db.init_db(config.db_path)
 
@@ -57,6 +99,14 @@ def create_app(config: Config) -> FastAPI:
     )
     tts = _build_tts_engine(config)
     llm = LiteLlmClient(model=config.default_model, db_path=config.db_path)
+    # Weather, agenda, alarms/timers: always available to the model. The
+    # GitHub MCP tools are added in lifespan() once that server connects.
+    assistant_tools = AssistantTools(
+        config.db_path,
+        build_calendar_services(config.google_calendar_accounts_path) if config.google_calendar_accounts_path else [],
+    )
+    local_tools = CombinedTools(assistant_tools)
+    llm.set_tools(local_tools.specs, local_tools.call)
     logger.info("models loaded, ready to accept connections")
 
     navidrome = None
@@ -84,30 +134,10 @@ def create_app(config: Config) -> FastAPI:
         # used to run before the loop with no guard at all, so any
         # failure here killed run_scheduler() entirely -- see C2 in the
         # final review, which this per-account loop preserves).
-        calendar_accounts = []
-        if config.google_calendar_accounts_path:
-            try:
-                from google.oauth2.credentials import Credentials
-                from googleapiclient.discovery import build
-
-                accounts = load_accounts(config.google_calendar_accounts_path)
-            except Exception:
-                logger.exception(
-                    "failed to load %s -- Calendar polling disabled",
-                    config.google_calendar_accounts_path,
-                )
-                accounts = []
-            for account in accounts:
-                try:
-                    credentials = Credentials.from_authorized_user_file(account.credentials_path)
-                    service = build("calendar", "v3", credentials=credentials)
-                    calendar_accounts.append((account.label, service, account.calendar_ids))
-                except Exception:
-                    logger.exception(
-                        "failed to initialize the Google Calendar client for account=%s -- "
-                        "this account's polling disabled",
-                        account.label,
-                    )
+        calendar_accounts = (
+            build_calendar_services(config.google_calendar_accounts_path)
+            if config.google_calendar_accounts_path else []
+        )
 
         import httpx
 
@@ -169,6 +199,10 @@ def create_app(config: Config) -> FastAPI:
         else:
             logger.info("no GitHub token or Calendar credentials configured -- proactive events disabled")
 
+        alarms_task = asyncio.create_task(run_alarms(config.db_path, get_active_session))
+        alarms_task.add_done_callback(_log_if_task_exited_unexpectedly("run_alarms"))
+        background_tasks.append(alarms_task)
+
         mcp_client = None
         if config.github_token:
             from .mcp_client import McpToolClient
@@ -189,7 +223,8 @@ def create_app(config: Config) -> FastAPI:
                 )
                 mcp_client = None
             else:
-                llm.set_tools(mcp_client.tools, mcp_client.call_tool)
+                combined_tools = CombinedTools(assistant_tools, mcp_client.tools, mcp_client.call_tool)
+                llm.set_tools(combined_tools.specs, combined_tools.call)
                 logger.info("GitHub MCP tools loaded (%d tool(s))", len(mcp_client.tools))
         else:
             logger.info("GITHUB_TOKEN not set -- GitHub MCP tool-calling disabled")
@@ -233,15 +268,40 @@ def create_app(config: Config) -> FastAPI:
         # from above are reused directly across all connections.
         stt = ParakeetSttEngine(model=stt_model)
 
+        # Sends come from two coroutines now (the receive loop below and a
+        # voice turn's own task), so they're serialized per connection.
+        send_lock = asyncio.Lock()
+
         async def send_text(text: str) -> None:
-            await websocket.send_text(text)
+            async with send_lock:
+                await websocket.send_text(text)
+
+        pacer = AudioPacer()
 
         async def send_binary(data: bytes) -> None:
-            await websocket.send_bytes(data)
+            # Every audio stream (TTS reply, announcement, music) goes out at
+            # real time plus a bounded lead -- see AudioPacer. The wait
+            # happens before taking send_lock so text messages aren't held up.
+            await pacer.wait_before_sending(len(data))
+            async with send_lock:
+                await websocket.send_bytes(data)
 
         session = Session(stt, llm, tts, send_text, send_binary, db_path=config.db_path, navidrome=navidrome)
         nonlocal active_session
         active_session = session
+        turn_tasks: set[asyncio.Task] = set()
+
+        async def run_turn() -> None:
+            try:
+                await session.handle_end_of_speech()
+            except Exception:
+                # Deliberately generic on the wire: str(exc) here leaked
+                # provider tracebacks and absolute filesystem paths to an
+                # unauthenticated client. logger.exception already records
+                # the full traceback server-side, where it belongs.
+                logger.exception("turn failed")
+                with contextlib.suppress(Exception):
+                    await send_text(protocol.encode_error("internal error during turn"))
 
         try:
             while True:
@@ -259,18 +319,20 @@ def create_app(config: Config) -> FastAPI:
                     if isinstance(parsed, protocol.HelloMessage):
                         await session.handle_hello(parsed.session_id)
                     elif isinstance(parsed, protocol.EndOfSpeechMessage):
-                        try:
-                            await session.handle_end_of_speech()
-                        except Exception:
-                            # Deliberately generic on the wire: str(exc) here
-                            # leaked provider tracebacks and absolute
-                            # filesystem paths to an unauthenticated client.
-                            # logger.exception already records the full
-                            # traceback server-side, where it belongs.
-                            logger.exception("turn failed")
-                            await send_text(
-                                protocol.encode_error("internal error during turn")
-                            )
+                        # Run as its own task, NOT awaited here. Found on
+                        # real hardware (2026-09-24): awaiting the whole
+                        # reply inline meant this loop stopped reading while
+                        # it streamed TTS audio out. The robot kept sending
+                        # camera frames (5/s), the server's TCP receive
+                        # buffer filled, the robot's writes blocked (a
+                        # frame send stuck 74s), which also stalled its
+                        # WebSocket task from reading our audio -- both
+                        # sides blocked sending to each other until the
+                        # robot's 60s THINKING/SPEAKING failsafe and a
+                        # dropped connection. The session's own lock still
+                        # serializes turns.
+                        turn_tasks.add(asyncio.create_task(run_turn()))
+                        turn_tasks.difference_update({t for t in turn_tasks if t.done()})
                     elif isinstance(parsed, protocol.InterruptMessage):
                         # Reachable precisely because handle_end_of_speech()'s
                         # music branch does NOT await playback inline (see
@@ -278,6 +340,12 @@ def create_app(config: Config) -> FastAPI:
                         # keep pulling messages, including this one, while a
                         # track streams in the background.
                         await session.handle_interrupt()
+                        # Barge-in over a normal reply too: the robot has
+                        # already stopped playing it, so stop generating
+                        # and sending the rest -- otherwise the user's new
+                        # turn would queue behind it on the session lock.
+                        for task in turn_tasks:
+                            task.cancel()
                     elif isinstance(parsed, protocol.CameraFrameMessage):
                         # asyncio.to_thread: Haar cascade detection is CPU-
                         # bound (a handful of ms at QVGA, but still a
@@ -289,10 +357,17 @@ def create_app(config: Config) -> FastAPI:
                         camera_preview.set_latest_frame(
                             parsed.jpeg, face_result.box if face_result is not None else None
                         )
-                        if face_result is not None:
-                            await send_text(protocol.encode_face_position(True, face_result.dx, face_result.dy))
-                        else:
-                            await send_text(protocol.encode_face_position(False))
+                        # Skipped (not queued) while a turn is mid-send:
+                        # waiting for send_lock here would stop this loop
+                        # from reading again -- the deadlock described at
+                        # EndOfSpeechMessage above. Positions are sent 5x/s
+                        # and only the newest matters, so dropping one is
+                        # harmless.
+                        if not send_lock.locked():
+                            if face_result is not None:
+                                await send_text(protocol.encode_face_position(True, face_result.dx, face_result.dy))
+                            else:
+                                await send_text(protocol.encode_face_position(False))
                 elif "bytes" in message and message["bytes"] is not None:
                     await session.handle_audio_frame(message["bytes"])
         except WebSocketDisconnect:
@@ -303,6 +378,10 @@ def create_app(config: Config) -> FastAPI:
             # receive() loop used here.
             logger.info("session %s disconnected", session.session_id)
         finally:
+            # A turn still streaming to a robot that's gone has nobody to
+            # talk to -- stop it rather than leave it running.
+            for task in turn_tasks:
+                task.cancel()
             # Reliably clears active_session no matter how the loop above
             # exited -- a normal "websocket.disconnect" message, a
             # WebSocketDisconnect exception, or anything else raised out

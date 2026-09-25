@@ -109,7 +109,8 @@ async def test_stream_reply_uses_default_system_prompt_with_no_override_or_memor
         [_ async for _ in client.stream_reply("ciao")]
 
     system_content = mock_acompletion.call_args.kwargs["messages"][0]["content"]
-    assert system_content == DEFAULT_SYSTEM_PROMPT
+    assert system_content.startswith(DEFAULT_SYSTEM_PROMPT)
+    assert "Adesso e' " in system_content
 
 
 async def test_stream_reply_uses_admin_overridden_prompt(tmp_path):
@@ -123,7 +124,7 @@ async def test_stream_reply_uses_admin_overridden_prompt(tmp_path):
         [_ async for _ in client.stream_reply("ciao")]
 
     system_content = mock_acompletion.call_args.kwargs["messages"][0]["content"]
-    assert system_content == "Sei un pirata."
+    assert system_content.startswith("Sei un pirata.")
 
 
 async def test_stream_reply_injects_stored_memories_into_system_prompt(tmp_path):
@@ -277,91 +278,146 @@ async def test_stream_reply_without_tools_is_unchanged(tmp_path):
     assert "tools" not in mock_acompletion.call_args.kwargs
 
 
-async def test_stream_reply_streams_the_reply_when_tools_configured_but_none_needed(tmp_path):
-    # I7: a turn that doesn't need a tool (e.g. "ciao") must still get a
-    # STREAMED reply even with tools configured -- not the decision
-    # call's non-streamed message.content returned as one whole chunk,
-    # which would kill time-to-first-audio for every turn just because
-    # GITHUB_TOKEN happens to be set.
-    decision_response = FakeCompletion("")  # message.content falsy, tool_calls=None
+class FakeToolCallDelta:
+    """One streamed fragment of a tool call, as litellm yields them: the id
+    and name arrive once, the JSON arguments in pieces."""
+
+    def __init__(self, index: int, id: str | None = None, name: str | None = None, arguments: str | None = None):
+        self.index = index
+        self.id = id
+        self.function = FakeToolCallFunction(name, arguments)
+
+
+class FakeStreamDelta:
+    def __init__(self, content=None, tool_calls=None) -> None:
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class FakeStreamChunk:
+    def __init__(self, content=None, tool_calls=None) -> None:
+        self.choices = [type("C", (), {"delta": FakeStreamDelta(content, tool_calls)})()]
+
+
+async def _fake_tool_stream(chunks):
+    for chunk in chunks:
+        yield chunk
+
+
+_TOOLS = [{"type": "function", "function": {"name": "meteo"}}]
+
+
+async def test_with_tools_a_turn_that_needs_none_is_one_streamed_call(tmp_path):
+    # No extra "decision" round trip: with tools configured, a plain reply
+    # ("ciao") streams from the very first call, same latency as no tools.
     client = _client(tmp_path)
-    client.set_tools(
-        tools=[{"type": "function", "function": {"name": "list_pull_requests"}}],
-        call_tool=AsyncMock(),
-    )
+    client.set_tools(tools=_TOOLS, call_tool=AsyncMock())
 
     with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
-        mock_acompletion.side_effect = [decision_response, _fake_stream(["[emotion:neutral] ciao"])]
+        mock_acompletion.return_value = _fake_tool_stream(
+            [FakeStreamChunk("[emotion:neutral] "), FakeStreamChunk("ciao")]
+        )
         chunks = [c async for c in client.stream_reply("ciao")]
 
     assert "".join(chunks) == "[emotion:neutral] ciao"
-    assert mock_acompletion.call_count == 2  # decision call + streamed follow-up
-    first_call, second_call = mock_acompletion.call_args_list
-    assert first_call.kwargs["stream"] is False
-    assert second_call.kwargs["stream"] is True
-    assert "tools" not in second_call.kwargs
+    assert mock_acompletion.call_count == 1
+    call = mock_acompletion.call_args.kwargs
+    assert call["stream"] is True and call["tools"] == _TOOLS
 
 
-async def test_stream_reply_calls_a_tool_when_the_model_requests_one(tmp_path):
-    fake_tool_call = FakeToolCall(id="call_1", name="list_pull_requests")
-    decision_response = FakeCompletion("")
-    decision_response.choices[0].message = FakeToolCallMessage([fake_tool_call])
+async def test_stream_reply_calls_the_tools_the_model_requests_then_streams_the_answer(tmp_path):
+    calls = []
 
     async def fake_call_tool(tool_call):
-        assert tool_call is fake_tool_call
-        return "2 open pull requests"
+        calls.append((tool_call.id, tool_call.function.name, tool_call.function.arguments))
+        return f"risultato {tool_call.function.name}"
 
     client = _client(tmp_path)
-    client.set_tools(
-        tools=[{"type": "function", "function": {"name": "list_pull_requests"}}],
-        call_tool=fake_call_tool,
-    )
+    client.set_tools(tools=_TOOLS, call_tool=fake_call_tool)
+    first = _fake_tool_stream([
+        FakeStreamChunk(tool_calls=[FakeToolCallDelta(0, id="call_1", name="meteo", arguments='{"cit')]),
+        FakeStreamChunk(tool_calls=[FakeToolCallDelta(0, arguments='y": "Lucca"}')]),
+        FakeStreamChunk(tool_calls=[FakeToolCallDelta(1, id="call_2", name="agenda", arguments='{}')]),
+    ])
 
     with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
-        mock_acompletion.side_effect = [
-            decision_response,
-            _fake_stream(["[emotion:neutral] hai 2 PR aperte"]),
-        ]
-        chunks = [c async for c in client.stream_reply("ho PR aperte?")]
+        mock_acompletion.side_effect = [first, _fake_stream(["[emotion:happy] Buongiorno!"])]
+        chunks = [c async for c in client.stream_reply("buongiorno")]
 
-    assert "".join(chunks) == "[emotion:neutral] hai 2 PR aperte"
-    assert mock_acompletion.call_count == 2  # one non-streamed decision call, one streamed follow-up
-    first_call, second_call = mock_acompletion.call_args_list
-    assert first_call.kwargs["tools"] == client._tools
-    assert first_call.kwargs["stream"] is False
-    assert second_call.kwargs["stream"] is True
-    assert "tool_call_id" in str(second_call.kwargs["messages"])  # the tool result was folded in
+    assert "".join(chunks) == "[emotion:happy] Buongiorno!"
+    assert calls == [("call_1", "meteo", '{"city": "Lucca"}'), ("call_2", "agenda", "{}")]
+    second = mock_acompletion.call_args_list[1].kwargs
+    assert second["stream"] is True and "tools" not in second
+    assistant = [m for m in second["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert [tc["id"] for tc in assistant[0]["tool_calls"]] == ["call_1", "call_2"]
+    tool_messages = [m for m in second["messages"] if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_messages] == ["call_1", "call_2"]
+    assert tool_messages[0]["content"] == "risultato meteo"
 
 
 async def test_stream_reply_feeds_an_error_string_back_when_a_tool_call_raises(tmp_path):
-    # A raising tool call (MCP server died, GitHub API error) must not
-    # propagate out of this async generator uncaught -- session.py would
-    # turn that into a generic "internal error during turn" with no
-    # spoken reply at all. It should instead become a "tool" message the
-    # model can react to in its own reply.
-    fake_tool_call = FakeToolCall(id="call_1", name="list_pull_requests")
-    decision_response = FakeCompletion("")
-    decision_response.choices[0].message = FakeToolCallMessage([fake_tool_call])
-
+    # A raising tool call must not propagate out of this async generator --
+    # session.py would turn that into a generic "internal error during
+    # turn" with no spoken reply. The model gets an error string instead.
     async def failing_call_tool(tool_call):
-        raise RuntimeError("MCP server died")
+        raise RuntimeError("servizio meteo irraggiungibile")
 
     client = _client(tmp_path)
-    client.set_tools(
-        tools=[{"type": "function", "function": {"name": "list_pull_requests"}}],
-        call_tool=failing_call_tool,
-    )
+    client.set_tools(tools=_TOOLS, call_tool=failing_call_tool)
+    first = _fake_tool_stream([FakeStreamChunk(tool_calls=[FakeToolCallDelta(0, id="call_1", name="meteo", arguments="{}")])])
 
     with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
-        mock_acompletion.side_effect = [
-            decision_response,
-            _fake_stream(["[emotion:sad] non riesco a leggere GitHub adesso"]),
-        ]
-        chunks = [c async for c in client.stream_reply("ho PR aperte?")]
+        mock_acompletion.side_effect = [first, _fake_stream(["[emotion:sad] non riesco a leggere il meteo"])]
+        chunks = [c async for c in client.stream_reply("che tempo fa?")]
 
-    assert "".join(chunks) == "[emotion:sad] non riesco a leggere GitHub adesso"
-    second_call = mock_acompletion.call_args_list[1]
-    tool_messages = [m for m in second_call.kwargs["messages"] if m.get("role") == "tool"]
-    assert len(tool_messages) == 1
+    assert "".join(chunks) == "[emotion:sad] non riesco a leggere il meteo"
+    tool_messages = [m for m in mock_acompletion.call_args_list[1].kwargs["messages"] if m.get("role") == "tool"]
     assert "Error calling tool" in tool_messages[0]["content"]
-    assert "MCP server died" in tool_messages[0]["content"]
+    assert "servizio meteo irraggiungibile" in tool_messages[0]["content"]
+
+
+async def test_stream_reply_puts_the_conversation_so_far_before_the_new_message(tmp_path):
+    client = _client(tmp_path)
+
+    with patch("haro_server.llm.litellm.acompletion", new=AsyncMock()) as mock_acompletion:
+        mock_acompletion.return_value = _fake_stream(["ok"])
+
+        history = [("cosa posso fare stasera?", "Film, passeggiata o pizza?"), ("la pizza", "Ottima scelta!")]
+        [_ async for _ in client.stream_reply("che ingredienti servono?", history=history)]
+
+    messages = mock_acompletion.call_args.kwargs["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1:] == [
+        {"role": "user", "content": "cosa posso fare stasera?"},
+        {"role": "assistant", "content": "Film, passeggiata o pizza?"},
+        {"role": "user", "content": "la pizza"},
+        {"role": "assistant", "content": "Ottima scelta!"},
+        {"role": "user", "content": "che ingredienti servono?"},
+    ]
+
+
+def test_effective_prompt_carries_the_current_local_time_and_routines(tmp_path):
+    import datetime
+    from zoneinfo import ZoneInfo
+
+    from haro_server.llm import _build_effective_system_prompt, set_routines
+
+    db_path = str(tmp_path / "haro.db")
+    db.init_db(db_path)
+    now = datetime.datetime(2026, 9, 25, 5, 30, tzinfo=datetime.UTC)  # 07:30 in Rome
+    set_routines(db_path, 'Quando dico "buongiorno": meteo di Lucca e Pisa e impegni di oggi.')
+
+    prompt = _build_effective_system_prompt(db_path, now=now)
+
+    assert "venerdì 25 settembre 2026, ore 07:30" in prompt
+    assert "Lucca e Pisa" in prompt
+    assert 'Quando dico "buongiorno"' in prompt
+
+
+def test_effective_prompt_has_no_routines_section_when_none_are_set(tmp_path):
+    from haro_server.llm import _build_effective_system_prompt
+
+    db_path = str(tmp_path / "haro.db")
+    db.init_db(db_path)
+
+    assert "Routine definite" not in _build_effective_system_prompt(db_path)

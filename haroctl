@@ -94,23 +94,50 @@ cmd_start() {
     echo "started -- models take ~30-60s to load; follow with: $0 logs"
 }
 
+agent_pid() {
+    launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}'
+}
+
+port_in_use() { lsof -nP -iTCP:"$(port)" -sTCP:LISTEN >/dev/null 2>&1; }
+
 cmd_stop() {
-    if is_loaded; then
-        launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-        # bootout returns before the service is actually gone (the server
-        # shuts down gracefully first); bootstrapping again in that window
-        # gets undone by the still-running bootout -- found by a `restart`
-        # that printed "started" but left nothing running.
-        local i
-        for i in $(seq 1 60); do
-            is_loaded || break
+    if ! is_loaded; then
+        echo "not running"
+        return
+    fi
+    local pid i
+    pid=$(agent_pid)
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    # bootout returns before the service is actually gone, and even once
+    # launchd has dropped it the process can still be shutting down with
+    # the port bound -- found by a restart whose new server failed three
+    # times with "address already in use" for ~60s. Wait for the job, the
+    # process and the port, in that order; SIGKILL a process that won't exit.
+    for i in $(seq 1 60); do
+        is_loaded || break
+        sleep 0.5
+    done
+    if [[ -n "$pid" ]]; then
+        for i in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || break
             sleep 0.5
         done
-        if is_loaded; then echo "still stopping after 30s" >&2; exit 1; fi
-        echo "stopped"
-    else
-        echo "not running"
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "server (pid $pid) still running after 15s -- killing it" >&2
+            kill -9 "$pid" 2>/dev/null || true
+            sleep 0.5
+        fi
     fi
+    for i in $(seq 1 20); do
+        port_in_use || break
+        sleep 0.5
+    done
+    if port_in_use; then
+        echo "port $(port) is still in use by another process:" >&2
+        lsof -nP -iTCP:"$(port)" -sTCP:LISTEN >&2
+        exit 1
+    fi
+    echo "stopped"
 }
 
 cmd_status() {

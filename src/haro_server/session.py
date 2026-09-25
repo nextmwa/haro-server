@@ -1,9 +1,12 @@
 import asyncio
 import logging
 import re
+import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 
-from . import actions, db, music, protocol
+from . import actions, alarms, db, music, protocol, turn_audio
+from .alarm_sound import gentle_chimes
+from .tts_common import DEVICE_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +25,7 @@ class SttEngineLike(Protocol):
 
 
 class LlmClientLike(Protocol):
-    def stream_reply(self, transcript: str) -> AsyncIterator[str]: ...
+    def stream_reply(self, transcript: str, history: list[tuple[str, str]] | None = None) -> AsyncIterator[str]: ...
     async def extract_facts(self, transcript: str, reply: str) -> list[str]: ...
     async def extract_music_query(self, transcript: str) -> str: ...
     async def pick_best_track(self, transcript: str, candidates: list[Any]) -> Any | None: ...
@@ -42,6 +45,35 @@ SendBinary = Callable[[bytes], Awaitable[None]]
 
 _EMOTION_RE = re.compile(r"^\[emotion:(happy|sad|confused|neutral)\]\s*")
 _MAX_PREFIX_SCAN = 40  # generous upper bound for "[emotion:confused] "
+
+
+class Conversation:
+    """The exchange in progress, passed to the LLM on each turn so replies
+    can build on what was just said (e.g. the robot's follow-up listening
+    window, where the user answers without repeating the wake word).
+
+    Forgotten after IDLE_RESET_SECONDS without a turn, so a new request
+    minutes later doesn't drag in an unrelated old topic; capped at
+    MAX_TURNS to bound prompt size and cost.
+    """
+
+    IDLE_RESET_SECONDS = 300
+    MAX_TURNS = 8
+
+    def __init__(self, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._turns: list[tuple[str, str]] = []
+        self._last_turn_at = 0.0
+
+    def history(self) -> list[tuple[str, str]]:
+        if self._turns and self._clock() - self._last_turn_at > self.IDLE_RESET_SECONDS:
+            self._turns = []
+        return list(self._turns)
+
+    def add(self, user_text: str, reply_text: str) -> None:
+        self.history()  # applies the idle reset first
+        self._turns = (self._turns + [(user_text, reply_text)])[-self.MAX_TURNS:]
+        self._last_turn_at = self._clock()
 
 
 class Session:
@@ -68,6 +100,13 @@ class Session:
         # gets a plain error reply instead of attempting playback. See
         # _play_music()/handle_interrupt().
         self._navidrome = navidrome
+        # The raw PCM16 the robot sent for the turn in progress, kept
+        # alongside the STT buffer so turn_audio.py can save it next to the
+        # transcript for the admin page's playback. _turn_audio_done holds
+        # the finished turn's copy while _save_transcript() runs.
+        self._turn_audio = bytearray()
+        self._turn_audio_done = b""
+        self._conversation = Conversation()
         self._music_task: asyncio.Task | None = None
         # Set only while speak_announcement()'s own task is in flight --
         # handle_interrupt() cancels this the same way it cancels
@@ -98,6 +137,7 @@ class Session:
 
     async def handle_audio_frame(self, frame: bytes) -> None:
         self._stt.feed(frame)
+        self._turn_audio.extend(frame)
 
     async def handle_end_of_speech(self) -> None:
         # Held for the full turn -- see self._lock's docstring in
@@ -109,6 +149,9 @@ class Session:
 
     async def _handle_end_of_speech_locked(self) -> None:
         self._reply_in_progress = True
+        # Taken (and reset) before transcribing, same reasoning as the STT
+        # engine's own buffer: a failing turn must not leak into the next.
+        self._turn_audio_done, self._turn_audio = bytes(self._turn_audio), bytearray()
         try:
             transcript = await self._stt.finalize()
             logger.debug("transcript: %s", transcript)
@@ -120,6 +163,9 @@ class Session:
                 # turn cleanly instead so the robot stops waiting.
                 logger.info("empty transcript, skipping LLM/TTS turn")
                 await self._send_text(protocol.encode_response_end())
+                # Still logged, with its audio: the turns where STT heard
+                # nothing are exactly the ones worth listening back to.
+                self._save_transcript(transcript, reply="[trascrizione vuota, nessuna risposta]", emotion=None)
                 return
 
             action = actions.match_action(transcript)
@@ -147,7 +193,7 @@ class Session:
                 self._music_task = asyncio.create_task(self._play_music(transcript))
                 return
 
-            raw_reply = self._llm.stream_reply(transcript)
+            raw_reply = self._llm.stream_reply(transcript, history=self._conversation.history())
             emotion, text_stream = await _split_emotion_prefix(raw_reply)
             await self._send_text(protocol.encode_emotion(emotion))
 
@@ -161,6 +207,12 @@ class Session:
             try:
                 async for chunk in tts_stream:
                     await self._send_binary(chunk)
+            except BaseException:
+                # Robot disconnected mid-reply, turn cancelled, ...: still
+                # log what was said and how far the reply got, instead of
+                # losing the turn from the admin transcript log entirely.
+                self._save_transcript(transcript, "".join(reply_parts) + " [risposta interrotta]", emotion)
+                raise
             finally:
                 # tts_stream, teed_stream, text_stream (the _prepend wrapper),
                 # and raw_reply each only delegate to the next via `async for`,
@@ -177,6 +229,7 @@ class Session:
             await self._send_text(protocol.encode_response_end())
 
             full_reply = "".join(reply_parts)
+            self._conversation.add(transcript, full_reply)
             self._save_transcript(transcript, full_reply, emotion)
             self._spawn_fact_extraction(transcript, full_reply)
         finally:
@@ -185,7 +238,9 @@ class Session:
     def _save_transcript(self, transcript: str, reply: str | None, emotion: str | None) -> None:
         if self._db_path is None:
             return
-        db.save_transcript(self._db_path, self.session_id or "unknown", transcript, reply, emotion)
+        transcript_id = db.save_transcript(self._db_path, self.session_id or "unknown", transcript, reply, emotion)
+        if self._turn_audio_done:
+            turn_audio.save(self._db_path, transcript_id, self._turn_audio_done)
 
     def _spawn_fact_extraction(self, transcript: str, reply: str) -> None:
         if self._db_path is None:
@@ -263,6 +318,49 @@ class Session:
                         await self._send_binary(chunk)
                 finally:
                     await tts_stream.aclose()
+                await self._send_text(protocol.encode_response_end())
+            finally:
+                self._reply_in_progress = False
+
+    async def ring_alarm(self, message: str) -> None:
+        """Rings an alarm or timer (alarms.py): rounds of gentle chimes at a
+        rising volume, each followed by `message` spoken. Cancellable like an
+        announcement -- the wake word ("Hey Kira, stop") sends an interrupt,
+        handle_interrupt() cancels this task, and the robot's follow-up
+        listening window lets the user say e.g. "rimanda di dieci minuti".
+        Returns normally whether it rang out or was stopped.
+        """
+        task = asyncio.ensure_future(self._ring_alarm_locked(message))
+        self._announcement_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info("alarm stopped by the user")
+        finally:
+            self._announcement_task = None
+
+    async def _ring_alarm_locked(self, message: str) -> None:
+        async with self._lock:
+            self._reply_in_progress = True
+            try:
+                await self._send_text(protocol.encode_emotion("happy"))
+                rounds = alarms.ROUNDS
+                for i in range(rounds):
+                    # From a whisper (8%) to full volume over the rounds.
+                    start_gain = 0.08 + 0.92 * i / rounds
+                    end_gain = 0.08 + 0.92 * (i + 1) / rounds
+                    chimes = await asyncio.to_thread(
+                        gentle_chimes, alarms.CHIME_SECONDS, start_gain, end_gain, i
+                    )
+                    one_second = DEVICE_SAMPLE_RATE * 2
+                    for offset in range(0, len(chimes), one_second):
+                        await self._send_binary(chimes[offset:offset + one_second])
+                    tts_stream = self._tts.synthesize(_single_chunk(message))
+                    try:
+                        async for chunk in tts_stream:
+                            await self._send_binary(chunk)
+                    finally:
+                        await tts_stream.aclose()
                 await self._send_text(protocol.encode_response_end())
             finally:
                 self._reply_in_progress = False

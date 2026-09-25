@@ -1,7 +1,7 @@
 import asyncio
 from typing import AsyncIterator
 
-from .tts_common import as_numpy, find_sentence_boundary, resample_to_device_rate, to_pcm16
+from .tts_common import as_numpy, resample_to_device_rate, speakable_sentences, to_pcm16
 
 
 class ChatterboxTtsEngine:
@@ -31,16 +31,8 @@ class ChatterboxTtsEngine:
         self._language = language
 
     async def synthesize(self, text_stream: AsyncIterator[str]) -> AsyncIterator[bytes]:
-        buffer = ""
-        async for chunk in text_stream:
-            buffer += chunk
-            boundary = find_sentence_boundary(buffer)
-            while boundary is not None:
-                sentence, buffer = buffer[:boundary], buffer[boundary:]
-                yield await asyncio.to_thread(self._synthesize_sentence, sentence)
-                boundary = find_sentence_boundary(buffer)
-        if buffer.strip():
-            yield await asyncio.to_thread(self._synthesize_sentence, buffer)
+        async for sentence in speakable_sentences(text_stream):
+            yield await asyncio.to_thread(self._synthesize_sentence, sentence)
 
     def _synthesize_sentence(self, sentence: str) -> bytes:
         # Blocking, CPU-bound model inference -- run off the event loop the

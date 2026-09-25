@@ -26,6 +26,6 @@ async def test_synthesize_flushes_on_sentence_boundaries():
 
     chunks = [c async for c in engine.synthesize(_text_stream(["Ciao! ", "Come stai?"]))]
 
-    assert engine._pipeline.calls == ["Ciao! ", "Come stai?"]
+    assert engine._pipeline.calls == ["Ciao!", "Come stai?"]
     assert len(chunks) == 2
     assert all(isinstance(c, bytes) for c in chunks)

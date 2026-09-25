@@ -45,7 +45,7 @@ async def test_synthesize_flushes_on_sentence_boundaries():
     chunks = [c async for c in engine.synthesize(_text_stream(["Ciao! ", "Come stai?"]))]
 
     assert engine._model.calls == [
-        ("voice-state:giovanni", "Ciao! "),
+        ("voice-state:giovanni", "Ciao!"),
         ("voice-state:giovanni", "Come stai?"),
     ]
     assert len(chunks) >= 2
@@ -90,7 +90,7 @@ async def test_synthesize_uses_the_configured_voice_state():
 
     [_ async for _ in engine.synthesize(_text_stream(["Hola! "]))]
 
-    assert engine._model.calls == [("voice-state:lola", "Hola! ")]
+    assert engine._model.calls == [("voice-state:lola", "Hola!")]
 
 
 async def test_synthesize_flushes_trailing_text_without_a_terminator():
@@ -98,7 +98,7 @@ async def test_synthesize_flushes_trailing_text_without_a_terminator():
 
     chunks = [c async for c in engine.synthesize(_text_stream(["nessun punto finale"]))]
 
-    assert engine._model.calls == [("voice-state:giovanni", "nessun punto finale")]
+    assert engine._model.calls == [("voice-state:giovanni", "nessun punto finale.")]
     assert len(chunks) >= 1
 
 

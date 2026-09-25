@@ -121,3 +121,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# face_tracking.py's YuNet face-detection model.
+[tool.setuptools.package-data]
+haro_server = ["models/*.onnx"]

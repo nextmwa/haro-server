@@ -37,9 +37,10 @@ class FakeLlm:
         self.extract_music_query_calls: list[str] = []
         self.pick_best_track_calls: list[tuple[str, list]] = []
 
-    def stream_reply(self, transcript: str):
+    def stream_reply(self, transcript: str, history=None):
         self.stream_reply_calls += 1
         self.received_transcript = transcript
+        self.received_history = history
         return self._chunk_generator()
 
     async def _chunk_generator(self):
@@ -296,7 +297,7 @@ class TrackingLlm:
         self._chunks = chunks
         self.stream: _TrackingStream | None = None
 
-    def stream_reply(self, transcript: str):
+    def stream_reply(self, transcript: str, history=None):
         self.stream = _TrackingStream(self._chunks)
         return self.stream
 
@@ -820,3 +821,19 @@ async def test_handle_interrupt_with_no_active_announcement_is_a_no_op():
     session, *_ = _make_session(llm_chunks=[])
 
     await session.handle_interrupt()  # must not raise (covers both music and announcement branches)
+
+
+async def test_the_second_turn_gets_the_first_one_as_context():
+    async def noop(_):
+        pass
+
+    llm = FakeLlm(chunks=["[emotion:neutral] Film, passeggiata o pizza?"])
+    stt = FakeStt(transcript="cosa posso fare stasera?")
+    session = Session(stt, llm, FakeTts(), noop, noop)
+    await session.handle_end_of_speech()
+    assert llm.received_history == []
+
+    stt._transcript = "la pizza"
+    await session.handle_end_of_speech()
+
+    assert llm.received_history == [("cosa posso fare stasera?", "Film, passeggiata o pizza?")]

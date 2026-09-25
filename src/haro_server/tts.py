@@ -3,7 +3,7 @@ from typing import AsyncIterator
 
 from .tts_common import (
     as_numpy,
-    find_sentence_boundary,
+    speakable_sentences,
     resample_to_device_rate,
     to_pcm16,
 )
@@ -37,19 +37,8 @@ class KokoroTtsEngine:
         self._voice = voice
 
     async def synthesize(self, text_stream: AsyncIterator[str]) -> AsyncIterator[bytes]:
-        buffer = ""
-        async for chunk in text_stream:
-            buffer += chunk
-            boundary = find_sentence_boundary(buffer)
-            while boundary is not None:
-                sentence, buffer = buffer[:boundary], buffer[boundary:]
-                for pcm_chunk in await asyncio.to_thread(
-                    self._synthesize_sentence, sentence
-                ):
-                    yield pcm_chunk
-                boundary = find_sentence_boundary(buffer)
-        if buffer.strip():
-            for pcm_chunk in await asyncio.to_thread(self._synthesize_sentence, buffer):
+        async for sentence in speakable_sentences(text_stream):
+            for pcm_chunk in await asyncio.to_thread(self._synthesize_sentence, sentence):
                 yield pcm_chunk
 
     def _synthesize_sentence(self, sentence: str) -> list[bytes]:

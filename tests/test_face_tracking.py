@@ -27,8 +27,8 @@ def test_detect_face_returns_none_for_empty_bytes():
     assert face_tracking.detect_face(b"") is None
 
 
-# Deliberately not tested here: actually detecting a real face. Haar
-# cascades need a real photographic face to exercise meaningfully (not a
+# Deliberately not tested here: actually detecting a real face. The
+# detector needs a real photographic face to exercise meaningfully (not a
 # synthetic shape), and no appropriately-licensed test photo was available
 # to check into this repo -- this was instead verified against real
 # frames from the robot's own camera during development (see the

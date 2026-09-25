@@ -1,10 +1,13 @@
+import datetime
 import json
 import logging
 from typing import AsyncIterator, Protocol
 
 import litellm
+from litellm.types.utils import ChatCompletionMessageToolCall, Function
 
 from . import db
+from .assistant_tools import describe_now
 
 
 class MusicCandidateLike(Protocol):
@@ -22,6 +25,8 @@ class MusicCandidateLike(Protocol):
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """Sei Haro, un assistente vocale amichevole su un piccolo robot da scrivania. Rispondi in modo naturale e conciso, adatto a una conversazione vocale (frasi brevi, colloquiali, senza formattazione markdown).
+
+La tua risposta viene letta ad alta voce da una sintesi vocale, non mostrata su uno schermo: scrivi solo frasi parlate, ognuna chiusa da punto, punto esclamativo o punto interrogativo. Non usare mai elenchi puntati o numerati, trattini a inizio riga, titoli, grassetto, virgolette, emoji o simboli. Se devi proporre più opzioni, dille in una o due frasi normali, per esempio: "Potresti guardare un film, uscire a fare una passeggiata oppure provare una ricetta nuova."
 
 Inizia SEMPRE la tua risposta con un tag di emozione tra parentesi quadre, scegliendo esattamente uno tra: happy, sad, confused, neutral. Formato esatto, senza eccezioni: [emotion:happy] seguito dal testo della risposta.
 
@@ -51,13 +56,37 @@ def set_base_system_prompt(db_path: str, prompt: str) -> None:
     db.set_config_value(db_path, _SYSTEM_PROMPT_CONFIG_KEY, prompt)
 
 
-def _build_effective_system_prompt(db_path: str) -> str:
-    base = get_base_system_prompt(db_path)
+_ROUTINES_CONFIG_KEY = "routines"
+
+
+def get_routines(db_path: str) -> str:
+    return db.get_config_value(db_path, _ROUTINES_CONFIG_KEY) or ""
+
+
+def set_routines(db_path: str, routines: str) -> None:
+    db.set_config_value(db_path, _ROUTINES_CONFIG_KEY, routines)
+
+
+def _build_effective_system_prompt(db_path: str, now: datetime.datetime | None = None) -> str:
+    prompt = get_base_system_prompt(db_path)
     memories = db.get_memories(db_path)
-    if not memories:
-        return base
-    facts = "\n".join(f"- {m.fact}" for m in memories)
-    return f"{base}\n\nCose che sai gia' sull'utente, da usare quando pertinenti (non elencarle a meno che non ti venga chiesto):\n{facts}"
+    if memories:
+        facts = "\n".join(f"- {m.fact}" for m in memories)
+        prompt += f"\n\nCose che sai gia' sull'utente, da usare quando pertinenti (non elencarle a meno che non ti venga chiesto):\n{facts}"
+    # Without the current date/time the model can't resolve "oggi",
+    # "domani" or "svegliami alle 7" for its tools (assistant_tools.py).
+    now = now or datetime.datetime.now(datetime.UTC)
+    prompt += (
+        f"\n\nAdesso e' {describe_now(now)} (ora italiana). Le citta' dell'utente sono Lucca e Pisa. "
+        "Per meteo, impegni, sveglie e timer usa sempre gli strumenti a disposizione, non inventare."
+    )
+    routines = get_routines(db_path).strip()
+    if routines:
+        prompt += (
+            "\n\nRoutine definite dall'utente: quando dice una di queste frasi (anche con parole simili), "
+            f"esegui le istruzioni usando gli strumenti e rispondi in modo naturale:\n{routines}"
+        )
+    return prompt
 
 
 def _strip_code_fence(text: str) -> str:
@@ -96,11 +125,17 @@ class LiteLlmClient:
         self._tools = tools
         self._call_tool = call_tool
 
-    async def stream_reply(self, transcript: str) -> AsyncIterator[str]:
-        messages = [
-            {"role": "system", "content": _build_effective_system_prompt(self._db_path)},
-            {"role": "user", "content": transcript},
-        ]
+    async def stream_reply(
+        self, transcript: str, history: list[tuple[str, str]] | None = None
+    ) -> AsyncIterator[str]:
+        """`history`: the conversation so far, oldest first, as (user said,
+        Haro replied) pairs -- so a follow-up like "sì, la seconda" has
+        something to refer to. See session.py's Conversation."""
+        messages = [{"role": "system", "content": _build_effective_system_prompt(self._db_path)}]
+        for user_text, reply_text in history or []:
+            messages.append({"role": "user", "content": user_text})
+            messages.append({"role": "assistant", "content": reply_text})
+        messages.append({"role": "user", "content": transcript})
 
         if not self._tools:
             response = await litellm.acompletion(model=self._model, messages=messages, stream=True)
@@ -110,49 +145,59 @@ class LiteLlmClient:
                     yield delta
             return
 
-        # Tools configured: decide tool use via a non-streamed call first
-        # -- see this task's Context note for why streaming isn't used
-        # for this decision step.
-        decision = await litellm.acompletion(
-            model=self._model, messages=messages, tools=self._tools, tool_choice="auto", stream=False
+        # Tools configured: ONE streamed call that can either answer or ask
+        # for tools. Text deltas are yielded as they arrive (a plain reply
+        # has the same time-to-first-audio as with no tools); tool-call
+        # deltas (id/name once, JSON arguments in pieces) are collected.
+        # Replaced a non-streamed "decision" call made before every turn,
+        # which added a whole round trip to every reply once weather/
+        # calendar/alarm tools became always-on (2026-09-24).
+        response = await litellm.acompletion(
+            model=self._model, messages=messages, tools=self._tools, tool_choice="auto", stream=True
         )
-        message = decision.choices[0].message
-        if not message.tool_calls:
-            # No tool needed for this turn (e.g. "ciao", "che ore sono")
-            # -- make a second, streamed call instead of returning the
-            # decision call's non-streamed message.content as one whole
-            # chunk. Without this, EVERY turn pays for time-to-first-audio
-            # as if it needed a tool just because GITHUB_TOKEN happens to
-            # be configured -- see I7 in the final review. This still
-            # costs two round trips overall (the decision call is
-            # unavoidable to know whether a tool is needed at all), but
-            # the reply itself streams normally instead of arriving as
-            # one late blob.
-            response = await litellm.acompletion(model=self._model, messages=messages, stream=True)
-            async for chunk in response:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
+        pending: dict[int, dict[str, str]] = {}
+        async for chunk in response:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+            for fragment in getattr(delta, "tool_calls", None) or []:
+                slot = pending.setdefault(fragment.index, {"id": "", "name": "", "arguments": ""})
+                if fragment.id:
+                    slot["id"] = fragment.id
+                function = getattr(fragment, "function", None)
+                if function is not None:
+                    slot["name"] += function.name or ""
+                    slot["arguments"] += function.arguments or ""
+        if not pending:
             return
 
-        messages.append(message.model_dump())
-        for tool_call in message.tool_calls:
+        tool_calls = [pending[i] for i in sorted(pending)]
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
+                for c in tool_calls
+            ],
+        })
+        for c in tool_calls:
+            # litellm's own type: MCP's call_openai_tool() reads it by
+            # item (tool_call["function"]["name"]), local tools by attribute.
+            tool_call = ChatCompletionMessageToolCall(
+                id=c["id"], type="function", function=Function(name=c["name"], arguments=c["arguments"] or "{}")
+            )
             try:
                 result = await self._call_tool(tool_call)
             except Exception as exc:
-                # The MCP server can die mid-session, the GitHub API can
-                # error out, etc. -- letting this propagate out of this
-                # async generator turns it into session.py's generic
-                # "internal error during turn" with no spoken reply at
-                # all. Feed the model an error string instead so it can
-                # tell the user something sensible in its own reply (e.g.
-                # "non riesco a leggere GitHub adesso").
-                logger.exception("tool call failed: %s", getattr(tool_call, "id", "?"))
+                # A failing tool (weather API down, MCP server died, ...)
+                # must not end the turn with no spoken reply: feed the
+                # model an error string so it can say something sensible.
+                logger.exception("tool call failed: %s", c["name"])
                 result = f"Error calling tool: {exc}"
-            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+            messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
 
         # Follow-up call, no tools offered this time -- a plain streamed
-        # reply, identical in shape to the no-tools-configured path above.
+        # reply built on the tool results.
         response = await litellm.acompletion(model=self._model, messages=messages, stream=True)
         async for chunk in response:
             delta = chunk.choices[0].delta.content

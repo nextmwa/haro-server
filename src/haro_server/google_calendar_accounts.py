@@ -13,6 +13,10 @@ built there directly.
 """
 import dataclasses
 import json
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -35,3 +39,28 @@ def load_accounts(path: str) -> list[GoogleCalendarAccount]:
         )
         for entry in raw
     ]
+
+
+def build_calendar_services(path: str) -> list[tuple[str, Any, list[str]]]:
+    """(label, Google Calendar API client, calendar ids) for every account in
+    `path` whose token loads. One account's bad or expired token only drops
+    that account (logged), never the others. Each call builds NEW clients:
+    googleapiclient's HTTP layer isn't thread-safe, so the poller and the
+    assistant's agenda tool (which reads calendars from worker threads)
+    each keep their own."""
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    try:
+        accounts = load_accounts(path)
+    except Exception:
+        logger.exception("failed to load %s -- Google Calendar disabled", path)
+        return []
+    services = []
+    for account in accounts:
+        try:
+            credentials = Credentials.from_authorized_user_file(account.credentials_path)
+            services.append((account.label, build("calendar", "v3", credentials=credentials), account.calendar_ids))
+        except Exception:
+            logger.exception("failed to initialize the Google Calendar client for account=%s", account.label)
+    return services
